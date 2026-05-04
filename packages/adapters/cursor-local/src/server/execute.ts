@@ -2,7 +2,14 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { inferOpenAiCompatibleBiller, type AdapterExecutionContext, type AdapterExecutionResult } from "@paperclipai/adapter-utils";
+import {
+  getSessionPolicy,
+  inferOpenAiCompatibleBiller,
+  shouldPersistSession,
+  shouldResumeSession,
+  type AdapterExecutionContext,
+  type AdapterExecutionResult,
+} from "@paperclipai/adapter-utils";
 import {
   adapterExecutionTargetIsRemote,
   adapterExecutionTargetRemoteCwd,
@@ -41,6 +48,7 @@ import {
   stringifyPaperclipWakePayload,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   joinPromptSections,
+  buildSessionPolicySummaryPrompt,
 } from "@paperclipai/adapter-utils/server-utils";
 import { DEFAULT_CURSOR_LOCAL_MODEL } from "../index.js";
 import { parseCursorJsonl, isCursorUnknownSessionError } from "./parse.js";
@@ -193,6 +201,9 @@ export async function ensureCursorSkillsInjected(
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const { runId, agent, runtime, config, context, onLog, onMeta, onSpawn, authToken } = ctx;
+  const sessionPolicy = getSessionPolicy(config);
+  const resumeSessionEnabled = shouldResumeSession(config);
+  const persistSessionEnabled = shouldPersistSession(config);
   const executionTarget = readAdapterExecutionTarget({
     executionTarget: ctx.executionTarget,
     legacyRemoteExecution: ctx.executionTransport?.remoteExecution,
@@ -435,8 +446,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     runtimeSessionId.length > 0 &&
     (runtimeSessionCwd.length === 0 || path.resolve(runtimeSessionCwd) === path.resolve(effectiveExecutionCwd)) &&
     adapterExecutionTargetSessionMatches(runtimeRemoteExecution, executionTarget);
-  const sessionId = canResumeSession ? runtimeSessionId : null;
-  if (executionTargetIsRemote && runtimeSessionId && !canResumeSession) {
+  const sessionId = resumeSessionEnabled && canResumeSession ? runtimeSessionId : null;
+  if (runtimeSessionId && !resumeSessionEnabled) {
+    await onLog(
+      "stdout",
+      `[paperclip] Cursor session policy "${sessionPolicy}" disables saved session resume. Starting a fresh session.\n`,
+    );
+  } else if (executionTargetIsRemote && runtimeSessionId && !canResumeSession) {
     await onLog(
       "stdout",
       `[paperclip] Cursor session "${runtimeSessionId}" does not match the current remote execution identity and will not be resumed in "${effectiveExecutionCwd}". Starting a fresh remote session.\n`,
@@ -512,12 +528,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const shouldUseResumeDeltaPrompt = Boolean(sessionId) && wakePrompt.length > 0;
   const renderedPrompt = shouldUseResumeDeltaPrompt ? "" : renderTemplate(promptTemplate, templateData);
   const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
+  const sessionPolicySummaryPrompt =
+    sessionPolicy === "summarized"
+      ? await buildSessionPolicySummaryPrompt({ cwd, adapterConfig: config })
+      : "";
   const paperclipEnvNote = renderPaperclipEnvNote(env);
   const prompt = joinPromptSections([
     instructionsPrefix,
     renderedBootstrapPrompt,
     wakePrompt,
     sessionHandoffNote,
+    sessionPolicySummaryPrompt,
     paperclipEnvNote,
     renderedPrompt,
   ]);
@@ -527,6 +548,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     bootstrapPromptChars: renderedBootstrapPrompt.length,
     wakePromptChars: wakePrompt.length,
     sessionHandoffChars: sessionHandoffNote.length,
+    sessionPolicySummaryChars: sessionPolicySummaryPrompt.length,
     runtimeNoteChars: paperclipEnvNote.length,
     heartbeatPromptChars: renderedPrompt.length,
   };
@@ -629,7 +651,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       };
     }
 
-    const resolvedSessionId = attempt.parsed.sessionId ?? runtimeSessionId ?? runtime.sessionId ?? null;
+    const resolvedSessionId = persistSessionEnabled
+      ? attempt.parsed.sessionId ?? runtimeSessionId ?? runtime.sessionId ?? null
+      : null;
     const resolvedSessionParams = resolvedSessionId
       ? ({
           sessionId: resolvedSessionId,
@@ -673,7 +697,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         stderr: attempt.proc.stderr,
       },
       summary: attempt.parsed.summary,
-      clearSession: Boolean(clearSessionOnMissingSession && !resolvedSessionId),
+      clearSession: !persistSessionEnabled || Boolean(clearSessionOnMissingSession && !resolvedSessionId),
     };
   };
 

@@ -7,6 +7,7 @@ import {
 } from "../../components/agent-config-primitives";
 import { ChoosePathButton } from "../../components/PathInstructionsModal";
 import { LocalWorkspaceRuntimeFields } from "../local-workspace-runtime-fields";
+import { SessionPolicyField } from "../session-policy-field";
 import {
   CODEX_LOCAL_FAST_MODE_SUPPORTED_MODELS,
   isCodexLocalFastModeSupported,
@@ -132,6 +133,14 @@ export function CodexLocalConfigFields({
         mode={mode}
         adapterType={adapterType}
         models={models}
+      />
+      <SessionPolicyField
+        isCreate={isCreate}
+        values={values}
+        set={set}
+        config={config}
+        mark={mark}
+        eff={eff}
       />
     </>
   );

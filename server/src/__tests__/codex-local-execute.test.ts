@@ -1041,6 +1041,101 @@ describe("codex execute", () => {
       await fs.rm(root, { recursive: true, force: true });
     }
   });
+
+  it("fresh session policy does not call codex resume or persist a new session", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-fresh-policy-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "codex");
+    const capturePath = path.join(root, "capture.json");
+    await fs.mkdir(workspace, { recursive: true });
+    await writeFakeCodexCommand(commandPath);
+
+    try {
+      const result = await execute({
+        runId: "run-fresh-policy",
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "Codex Coder",
+          adapterType: "codex_local",
+          adapterConfig: {},
+        },
+        runtime: {
+          sessionId: null,
+          sessionParams: { sessionId: "codex-session-old", cwd: workspace },
+          sessionDisplayId: null,
+          taskKey: null,
+        },
+        config: {
+          command: commandPath,
+          cwd: workspace,
+          sessionPolicy: "fresh",
+          env: { PAPERCLIP_TEST_CAPTURE_PATH: capturePath },
+          promptTemplate: "Follow the fresh heartbeat.",
+        },
+        context: {},
+        authToken: "run-jwt-token",
+        onLog: async () => {},
+      });
+
+      const capture = JSON.parse(await fs.readFile(capturePath, "utf8")) as CapturePayload;
+      expect(capture.argv).not.toContain("resume");
+      expect(result.sessionId).toBeNull();
+      expect(result.sessionParams).toBeNull();
+      expect(result.clearSession).toBe(true);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("summarized session policy starts fresh and injects the handoff summary", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-summarized-policy-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "codex");
+    const capturePath = path.join(root, "capture.json");
+    await fs.mkdir(path.join(workspace, ".paperclip-agent"), { recursive: true });
+    await fs.writeFile(path.join(workspace, ".paperclip-agent", "NEXT_CONTEXT.md"), "Current goal: cap token growth", "utf8");
+    await fs.writeFile(path.join(workspace, ".paperclip-agent", "PROGRESS.md"), "Done: no resume", "utf8");
+    await writeFakeCodexCommand(commandPath);
+
+    try {
+      const result = await execute({
+        runId: "run-summarized-policy",
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "Codex Coder",
+          adapterType: "codex_local",
+          adapterConfig: {},
+        },
+        runtime: {
+          sessionId: null,
+          sessionParams: { sessionId: "codex-session-old", cwd: workspace },
+          sessionDisplayId: null,
+          taskKey: null,
+        },
+        config: {
+          command: commandPath,
+          cwd: workspace,
+          sessionPolicy: "summarized",
+          env: { PAPERCLIP_TEST_CAPTURE_PATH: capturePath },
+          promptTemplate: "Follow the summarized heartbeat.",
+        },
+        context: {},
+        authToken: "run-jwt-token",
+        onLog: async () => {},
+      });
+
+      const capture = JSON.parse(await fs.readFile(capturePath, "utf8")) as CapturePayload;
+      expect(capture.argv).not.toContain("resume");
+      expect(capture.prompt).toContain("fresh disposable session");
+      expect(capture.prompt).toContain("Current goal: cap token growth");
+      expect(capture.prompt).toContain("Done: no resume");
+      expect(result.sessionId).toBeNull();
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
   it("uses a worktree-isolated CODEX_HOME while preserving shared auth and config", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-execute-"));
     const workspace = path.join(root, "workspace");

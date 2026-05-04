@@ -1,7 +1,13 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
+import {
+  getSessionPolicy,
+  shouldPersistSession,
+  shouldResumeSession,
+  type AdapterExecutionContext,
+  type AdapterExecutionResult,
+} from "@paperclipai/adapter-utils";
 import type { RunProcessResult } from "@paperclipai/adapter-utils/server-utils";
 import {
   adapterExecutionTargetIsRemote,
@@ -39,6 +45,7 @@ import {
   shapePaperclipWorkspaceEnvForExecution,
   stringifyPaperclipWakePayload,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
+  buildSessionPolicySummaryPrompt,
 } from "@paperclipai/adapter-utils/server-utils";
 import { shellQuote } from "@paperclipai/adapter-utils/ssh";
 import {
@@ -329,6 +336,9 @@ export async function runClaudeLogin(input: {
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const { runId, agent, runtime, config, context, onLog, onMeta, onSpawn, authToken } = ctx;
+  const sessionPolicy = getSessionPolicy(config);
+  const resumeSessionEnabled = shouldResumeSession(config);
+  const persistSessionEnabled = shouldPersistSession(config);
   const executionTarget = readAdapterExecutionTarget({
     executionTarget: ctx.executionTarget,
     legacyRemoteExecution: ctx.executionTransport?.remoteExecution,
@@ -529,8 +539,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     hasMatchingPromptBundle &&
     (runtimeSessionCwd.length === 0 || path.resolve(runtimeSessionCwd) === path.resolve(effectiveExecutionCwd)) &&
     adapterExecutionTargetSessionMatches(runtimeRemoteExecution, executionTarget);
-  const sessionId = canResumeSession ? runtimeSessionId : null;
-  if (
+  const sessionId = resumeSessionEnabled && canResumeSession ? runtimeSessionId : null;
+  if (runtimeSessionId && !resumeSessionEnabled) {
+    await onLog(
+      "stdout",
+      `[paperclip] Claude session policy "${sessionPolicy}" disables saved session resume. Starting a fresh session.\n`,
+    );
+  } else if (
     executionTargetIsRemote &&
     runtimeSessionId &&
     !canResumeSession
@@ -578,11 +593,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const shouldUseResumeDeltaPrompt = Boolean(sessionId) && wakePrompt.length > 0;
   const renderedPrompt = shouldUseResumeDeltaPrompt ? "" : renderTemplate(promptTemplate, templateData);
   const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
+  const sessionPolicySummaryPrompt =
+    sessionPolicy === "summarized"
+      ? await buildSessionPolicySummaryPrompt({ cwd, adapterConfig: config })
+      : "";
   const taskContextNote = asString(context.paperclipTaskMarkdown, "").trim();
   const prompt = joinPromptSections([
     renderedBootstrapPrompt,
     wakePrompt,
     sessionHandoffNote,
+    sessionPolicySummaryPrompt,
     taskContextNote,
     renderedPrompt,
   ]);
@@ -591,6 +611,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     bootstrapPromptChars: renderedBootstrapPrompt.length,
     wakePromptChars: wakePrompt.length,
     sessionHandoffChars: sessionHandoffNote.length,
+    sessionPolicySummaryChars: sessionPolicySummaryPrompt.length,
     taskContextChars: taskContextNote.length,
     heartbeatPromptChars: renderedPrompt.length,
   };
@@ -775,9 +796,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         };
       })();
 
-    const resolvedSessionId =
-      parsedStream.sessionId ??
-      (asString(parsed.session_id, opts.fallbackSessionId ?? "") || opts.fallbackSessionId);
+    const resolvedSessionId = persistSessionEnabled
+      ? parsedStream.sessionId ??
+        (asString(parsed.session_id, opts.fallbackSessionId ?? "") || opts.fallbackSessionId)
+      : null;
     const resolvedSessionParams = resolvedSessionId
       ? ({
         sessionId: resolvedSessionId,
@@ -852,7 +874,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       costUsd: parsedStream.costUsd ?? asNumber(parsed.total_cost_usd, 0),
       resultJson: mergedResultJson,
       summary: parsedStream.summary || asString(parsed.result, ""),
-      clearSession: clearSessionForMaxTurns || Boolean(opts.clearSessionOnMissingSession && !resolvedSessionId),
+      clearSession: !persistSessionEnabled || clearSessionForMaxTurns || Boolean(opts.clearSessionOnMissingSession && !resolvedSessionId),
     };
   };
 
@@ -873,7 +895,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       return toAdapterResult(retry, { fallbackSessionId: null, clearSessionOnMissingSession: true });
     }
 
-    return toAdapterResult(initial, { fallbackSessionId: runtimeSessionId || runtime.sessionId });
+    return toAdapterResult(initial, { fallbackSessionId: persistSessionEnabled ? runtimeSessionId || runtime.sessionId : null });
   } finally {
     if (paperclipBridge) {
       await paperclipBridge.stop();

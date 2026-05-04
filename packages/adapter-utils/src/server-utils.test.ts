@@ -7,6 +7,7 @@ import {
   applyPaperclipWorkspaceEnv,
   appendWithByteCap,
   buildInvocationEnvForLogs,
+  buildSessionPolicySummaryPrompt,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   materializePaperclipSkillCopy,
   renderPaperclipWakePrompt,
@@ -59,6 +60,29 @@ describe("buildInvocationEnvForLogs", () => {
     expect(loggedEnv.PAPERCLIP_RESOLVED_COMMAND).toBe(
       "env OPENAI_API_KEY=***REDACTED*** custom-acp --token ***REDACTED***",
     );
+  });
+});
+
+describe("buildSessionPolicySummaryPrompt", () => {
+  it("injects concise workspace handoff files", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-session-policy-"));
+    try {
+      await fs.mkdir(path.join(root, ".paperclip-agent"), { recursive: true });
+      await fs.writeFile(path.join(root, ".paperclip-agent", "NEXT_CONTEXT.md"), "Goal: finish adapter tests", "utf8");
+      await fs.writeFile(path.join(root, ".paperclip-agent", "PROGRESS.md"), "Done: helper", "utf8");
+
+      const prompt = await buildSessionPolicySummaryPrompt({
+        cwd: root,
+        adapterConfig: { sessionPolicy: "summarized", maxSummaryTokens: 2_000 },
+      });
+
+      expect(prompt).toContain("fresh disposable session");
+      expect(prompt).toContain("Goal: finish adapter tests");
+      expect(prompt).toContain("Done: helper");
+      expect(prompt).toContain("Do not include full logs");
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
   });
 });
 

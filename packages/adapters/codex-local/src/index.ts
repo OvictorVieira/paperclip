@@ -66,6 +66,10 @@ Core fields:
 - model (string, optional): Codex model id
 - modelReasoningEffort (string, optional): reasoning effort override (minimal|low|medium|high|xhigh) passed via -c model_reasoning_effort=...
 - promptTemplate (string, optional): run prompt template
+- sessionPolicy ("resume"|"fresh"|"summarized", optional): default resume; fresh/summarized never call codex resume or persist new session ids
+- summaryFile (string, optional): summarized policy handoff file, defaults to .paperclip-agent/NEXT_CONTEXT.md
+- progressFile (string, optional): summarized policy progress file, defaults to .paperclip-agent/PROGRESS.md
+- maxSummaryTokens (number, optional): summarized policy summary budget, defaults to 2000
 - search (boolean, optional): run codex with --search
 - fastMode (boolean, optional): enable Codex Fast mode; supported on GPT-5.4 and passed through for manual model IDs
 - dangerouslyBypassApprovalsAndSandbox (boolean, optional): run with bypass flag

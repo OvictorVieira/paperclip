@@ -3,7 +3,13 @@ import type { Dirent } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
+import {
+  getSessionPolicy,
+  shouldPersistSession,
+  shouldResumeSession,
+  type AdapterExecutionContext,
+  type AdapterExecutionResult,
+} from "@paperclipai/adapter-utils";
 import {
   adapterExecutionTargetIsRemote,
   adapterExecutionTargetRemoteCwd,
@@ -44,6 +50,7 @@ import {
   stringifyPaperclipWakePayload,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   runChildProcess,
+  buildSessionPolicySummaryPrompt,
 } from "@paperclipai/adapter-utils/server-utils";
 import { DEFAULT_GEMINI_LOCAL_MODEL } from "../index.js";
 import {
@@ -171,6 +178,9 @@ async function buildGeminiSkillsDir(
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const { runId, agent, runtime, config, context, onLog, onMeta, onSpawn, authToken } = ctx;
+  const sessionPolicy = getSessionPolicy(config);
+  const resumeSessionEnabled = shouldResumeSession(config);
+  const persistSessionEnabled = shouldPersistSession(config);
   const executionTarget = readAdapterExecutionTarget({
     executionTarget: ctx.executionTarget,
     legacyRemoteExecution: ctx.executionTransport?.remoteExecution,
@@ -387,8 +397,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     runtimeSessionId.length > 0 &&
     (runtimeSessionCwd.length === 0 || path.resolve(runtimeSessionCwd) === path.resolve(effectiveExecutionCwd)) &&
     adapterExecutionTargetSessionMatches(runtimeRemoteExecution, executionTarget);
-  const sessionId = canResumeSession ? runtimeSessionId : null;
-  if (executionTargetIsRemote && runtimeSessionId && !canResumeSession) {
+  const sessionId = resumeSessionEnabled && canResumeSession ? runtimeSessionId : null;
+  if (runtimeSessionId && !resumeSessionEnabled) {
+    await onLog(
+      "stdout",
+      `[paperclip] Gemini session policy "${sessionPolicy}" disables saved session resume. Starting a fresh session.\n`,
+    );
+  } else if (executionTargetIsRemote && runtimeSessionId && !canResumeSession) {
     await onLog(
       "stdout",
       `[paperclip] Gemini session "${runtimeSessionId}" does not match the current remote execution identity and will not be resumed in "${effectiveExecutionCwd}". Starting a fresh remote session.\n`,
@@ -453,6 +468,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const shouldUseResumeDeltaPrompt = Boolean(sessionId) && wakePrompt.length > 0;
   const renderedPrompt = shouldUseResumeDeltaPrompt ? "" : renderTemplate(promptTemplate, templateData);
   const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
+  const sessionPolicySummaryPrompt =
+    sessionPolicy === "summarized"
+      ? await buildSessionPolicySummaryPrompt({ cwd, adapterConfig: config })
+      : "";
   const paperclipEnvNote = renderPaperclipEnvNote(env);
   const apiAccessNote = renderApiAccessNote(env);
   const prompt = joinPromptSections([
@@ -460,6 +479,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     renderedBootstrapPrompt,
     wakePrompt,
     sessionHandoffNote,
+    sessionPolicySummaryPrompt,
     paperclipEnvNote,
     apiAccessNote,
     renderedPrompt,
@@ -470,6 +490,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     bootstrapPromptChars: renderedBootstrapPrompt.length,
     wakePromptChars: wakePrompt.length,
     sessionHandoffChars: sessionHandoffNote.length,
+    sessionPolicySummaryChars: sessionPolicySummaryPrompt.length,
     runtimeNoteChars: paperclipEnvNote.length + apiAccessNote.length,
     heartbeatPromptChars: renderedPrompt.length,
   };
@@ -569,8 +590,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     );
 
     // On retry, don't fall back to old session ID — the old session was stale
-    const canFallbackToRuntimeSession = !isRetry;
-    const resolvedSessionId = attempt.parsed.sessionId
+    const canFallbackToRuntimeSession = persistSessionEnabled && !isRetry;
+    const resolvedSessionId = (persistSessionEnabled ? attempt.parsed.sessionId : null)
       ?? (canFallbackToRuntimeSession ? (runtimeSessionId ?? runtime.sessionId ?? null) : null);
     const resolvedSessionParams = resolvedSessionId
       ? ({
@@ -616,7 +637,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       resultJson,
       summary: attempt.parsed.summary,
       question: attempt.parsed.question,
-      clearSession: clearSessionForTurnLimit || Boolean(clearSessionOnMissingSession && !resolvedSessionId),
+      clearSession: !persistSessionEnabled || clearSessionForTurnLimit || Boolean(clearSessionOnMissingSession && !resolvedSessionId),
     };
   };
 

@@ -61,6 +61,13 @@ export {
   redactCommandText,
 } from "./command-redaction.js";
 export { inferOpenAiCompatibleBiller } from "./billing.js";
+export type { SessionPolicy } from "./session-policy.js";
+export {
+  getSessionPolicy,
+  shouldResumeSession,
+  shouldPersistSession,
+  shouldInjectSummary,
+} from "./session-policy.js";
 // Keep the root adapter-utils entry browser-safe because the UI imports it.
 // The sandbox callback bridge stays available via its dedicated subpath export.
 export type {

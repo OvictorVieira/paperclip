@@ -1,7 +1,14 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { inferOpenAiCompatibleBiller, type AdapterExecutionContext, type AdapterExecutionResult } from "@paperclipai/adapter-utils";
+import {
+  getSessionPolicy,
+  inferOpenAiCompatibleBiller,
+  shouldPersistSession,
+  shouldResumeSession,
+  type AdapterExecutionContext,
+  type AdapterExecutionResult,
+} from "@paperclipai/adapter-utils";
 import {
   adapterExecutionTargetIsRemote,
   adapterExecutionTargetRemoteCwd,
@@ -35,6 +42,7 @@ import {
   stringifyPaperclipWakePayload,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   joinPromptSections,
+  buildSessionPolicySummaryPrompt,
 } from "@paperclipai/adapter-utils/server-utils";
 import {
   parseCodexJsonl,
@@ -281,6 +289,9 @@ export async function ensureCodexSkillsInjected(
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const { runId, agent, runtime, config, context, onLog, onMeta, onSpawn, authToken } = ctx;
+  const sessionPolicy = getSessionPolicy(config);
+  const resumeSessionEnabled = shouldResumeSession(config);
+  const persistSessionEnabled = shouldPersistSession(config);
 
   const promptTemplate = asString(
     config.promptTemplate,
@@ -520,8 +531,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const codexTransientFallbackMode = readCodexTransientFallbackMode(context);
   const forceSaferInvocation = fallbackModeUsesSaferInvocation(codexTransientFallbackMode);
   const forceFreshSession = fallbackModeUsesFreshSession(codexTransientFallbackMode);
-  const sessionId = canResumeSession && !forceFreshSession ? runtimeSessionId : null;
-  if (executionTargetIsRemote && runtimeSessionId && !canResumeSession) {
+  const sessionId = resumeSessionEnabled && canResumeSession && !forceFreshSession ? runtimeSessionId : null;
+  if (runtimeSessionId && !resumeSessionEnabled) {
+    await onLog(
+      "stdout",
+      `[paperclip] Codex session policy "${sessionPolicy}" disables saved session resume. Starting a fresh session.\n`,
+    );
+  } else if (executionTargetIsRemote && runtimeSessionId && !canResumeSession) {
     await onLog(
       "stdout",
       `[paperclip] Codex session "${runtimeSessionId}" does not match the current remote execution identity and will not be resumed in "${effectiveExecutionCwd}". Starting a fresh remote session.\n`,
@@ -635,12 +651,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   })();
   const renderedPrompt = shouldUseResumeDeltaPrompt ? "" : renderTemplate(promptTemplate, templateData);
   const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
+  const sessionPolicySummaryPrompt =
+    sessionPolicy === "summarized"
+      ? await buildSessionPolicySummaryPrompt({ cwd, adapterConfig: config })
+      : "";
   const prompt = joinPromptSections([
     promptInstructionsPrefix,
     renderedBootstrapPrompt,
     wakePrompt,
     codexFallbackHandoffNote,
     sessionHandoffNote,
+    sessionPolicySummaryPrompt,
     renderedPrompt,
   ]);
   const promptMetrics = {
@@ -649,6 +670,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     bootstrapPromptChars: renderedBootstrapPrompt.length,
     wakePromptChars: wakePrompt.length,
     sessionHandoffChars: sessionHandoffNote.length,
+    sessionPolicySummaryChars: sessionPolicySummaryPrompt.length,
     heartbeatPromptChars: renderedPrompt.length,
   };
 
@@ -722,9 +744,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       };
     }
 
-    const canFallbackToRuntimeSession = !isRetry && !forceFreshSession;
+    const canFallbackToRuntimeSession = persistSessionEnabled && !isRetry && !forceFreshSession;
     const resolvedSessionId =
-      attempt.parsed.sessionId ??
+      (persistSessionEnabled ? attempt.parsed.sessionId : null) ??
       (canFallbackToRuntimeSession ? (runtimeSessionId ?? runtime.sessionId ?? null) : null);
     const resolvedSessionParams = resolvedSessionId
       ? ({
@@ -793,7 +815,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
       },
       summary: attempt.parsed.summary,
-      clearSession: Boolean((clearSessionOnMissingSession || forceFreshSession) && !resolvedSessionId),
+      clearSession: !persistSessionEnabled || Boolean((clearSessionOnMissingSession || forceFreshSession) && !resolvedSessionId),
     };
   };
 

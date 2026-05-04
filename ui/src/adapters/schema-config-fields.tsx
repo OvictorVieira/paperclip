@@ -491,6 +491,7 @@ export function buildSchemaAdapterConfig(
   if (values.cwd) ac.cwd = values.cwd;
   if (values.command) ac.command = values.command;
   if (values.instructionsFilePath) ac.instructionsFilePath = values.instructionsFilePath;
+  if (values.sessionPolicy && values.sessionPolicy !== "resume") ac.sessionPolicy = values.sessionPolicy;
   if (values.thinkingEffort) ac.thinkingEffort = values.thinkingEffort;
 
   if (values.extraArgs) {

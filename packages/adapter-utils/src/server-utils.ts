@@ -78,6 +78,9 @@ export const MAX_CAPTURE_BYTES = 4 * 1024 * 1024;
 export const MAX_EXCERPT_BYTES = 32 * 1024;
 const TERMINAL_RESULT_SCAN_OVERLAP_CHARS = 64 * 1024;
 const SENSITIVE_ENV_KEY = /(key|token|secret|password|passwd|authorization|cookie)/i;
+const DEFAULT_SESSION_SUMMARY_FILE = ".paperclip-agent/NEXT_CONTEXT.md";
+const DEFAULT_SESSION_PROGRESS_FILE = ".paperclip-agent/PROGRESS.md";
+const DEFAULT_MAX_SUMMARY_CHARS = 8_000;
 const REDACTED_LOG_VALUE = "***REDACTED***";
 const PAPERCLIP_SKILL_ROOT_RELATIVE_CANDIDATES = [
   "../../skills",
@@ -208,6 +211,72 @@ export function asBoolean(value: unknown, fallback: boolean): boolean {
 
 export function asStringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+function resolveWorkspaceRelativePath(cwd: string, value: string, fallback: string): string {
+  const raw = value.trim() || fallback;
+  if (path.isAbsolute(raw)) return raw;
+  return path.resolve(cwd, raw);
+}
+
+function truncateSummaryText(text: string, maxSummaryTokens: number): string {
+  const maxChars = maxSummaryTokens > 0 ? Math.max(1_000, maxSummaryTokens * 4) : DEFAULT_MAX_SUMMARY_CHARS;
+  if (text.length <= maxChars) return text;
+  return text.slice(text.length - maxChars);
+}
+
+export async function buildSessionPolicySummaryPrompt(input: {
+  cwd: string;
+  adapterConfig: unknown;
+}): Promise<string> {
+  const config = parseObject(input.adapterConfig);
+  const summaryFile = asString(config.summaryFile, DEFAULT_SESSION_SUMMARY_FILE);
+  const progressFile = asString(config.progressFile, DEFAULT_SESSION_PROGRESS_FILE);
+  const maxSummaryTokens = asNumber(config.maxSummaryTokens, 2_000);
+  const summaryPath = resolveWorkspaceRelativePath(input.cwd, summaryFile, DEFAULT_SESSION_SUMMARY_FILE);
+  const progressPath = resolveWorkspaceRelativePath(input.cwd, progressFile, DEFAULT_SESSION_PROGRESS_FILE);
+  await fs.mkdir(path.dirname(summaryPath), { recursive: true }).catch(() => undefined);
+  await fs.mkdir(path.dirname(progressPath), { recursive: true }).catch(() => undefined);
+  const [summary, progress] = await Promise.all([
+    fs.readFile(summaryPath, "utf8").catch(() => ""),
+    fs.readFile(progressPath, "utf8").catch(() => ""),
+  ]);
+  const summaryText = truncateSummaryText(summary.trim(), maxSummaryTokens);
+  const progressText = truncateSummaryText(progress.trim(), maxSummaryTokens);
+
+  return [
+    "# Session Policy",
+    "",
+    "You are running in a fresh disposable session.",
+    "",
+    "Do not rely on previous chat/session memory.",
+    "",
+    "At the start:",
+    `1. Read \`${summaryFile}\` if it exists.`,
+    `2. Read \`${progressFile}\` if it exists.`,
+    "3. Inspect `git status`.",
+    "4. Continue only the next unfinished unit of work.",
+    "",
+    "Previous handoff summary:",
+    "",
+    summaryText || "(empty)",
+    "",
+    "Previous progress:",
+    "",
+    progressText || "(empty)",
+    "",
+    "At the end of the run:",
+    `1. Update \`${progressFile}\`.`,
+    `2. Update \`${summaryFile}\`.`,
+    `3. Keep \`${summaryFile}\` concise.`,
+    "4. Include only:",
+    "   - current goal;",
+    "   - completed work;",
+    "   - files changed;",
+    "   - known blockers;",
+    "   - next action.",
+    "5. Do not include full logs, full diffs, dependency dumps or repeated instructions.",
+  ].join("\n");
 }
 
 export function parseJson(value: string): Record<string, unknown> | null {
