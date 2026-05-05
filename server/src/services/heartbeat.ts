@@ -133,7 +133,10 @@ import { redactCurrentUserText, redactCurrentUserValue } from "../log-redaction.
 import { redactEventPayload } from "../redaction.js";
 import {
   hasSessionCompactionThresholds,
+  getSessionPolicy,
   resolveSessionCompactionPolicy,
+  shouldPersistSession,
+  shouldResumeSession,
   type SessionCompactionPolicy,
 } from "@paperclipai/adapter-utils";
 import {
@@ -6656,7 +6659,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         cwd: executionWorkspace.cwd,
       },
     });
-    const runtimeSessionParams = runtimeSessionResolution.sessionParams;
+    const adapterSessionPolicy = getSessionPolicy(runtimeConfig);
+    const adapterShouldResumeSession = shouldResumeSession(runtimeConfig);
+    const adapterShouldPersistSession = shouldPersistSession(runtimeConfig);
+    const runtimeSessionParams = adapterShouldResumeSession
+      ? runtimeSessionResolution.sessionParams
+      : null;
     const runtimeWorkspaceWarnings = [
       ...resolvedWorkspace.warnings,
       ...executionWorkspace.warnings,
@@ -6667,6 +6675,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               ? `Skipping saved session resume for task "${taskKey}" because ${sessionResetReason}.`
               : `Skipping saved session resume because ${sessionResetReason}.`,
           ]
+        : []),
+      ...(!adapterShouldResumeSession
+        ? [`Session policy "${adapterSessionPolicy}" disables saved session resume for this run.`]
         : []),
     ];
     context.paperclipWorkspace = {
@@ -6704,14 +6715,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (executionWorkspace.projectId && !readNonEmptyString(context.projectId)) {
       context.projectId = executionWorkspace.projectId;
     }
-    const runtimeSessionFallback = taskKey || resetTaskSession ? null : runtime.sessionId;
-    let previousSessionDisplayId = truncateDisplayId(
-      explicitResumeSessionDisplayId ??
-        taskSessionForRun?.sessionDisplayId ??
-        (sessionCodec.getDisplayId ? sessionCodec.getDisplayId(runtimeSessionParams) : null) ??
-        readNonEmptyString(runtimeSessionParams?.sessionId) ??
-        runtimeSessionFallback,
-    );
+    const runtimeSessionFallback =
+      !adapterShouldResumeSession || taskKey || resetTaskSession ? null : runtime.sessionId;
+    let previousSessionDisplayId = adapterShouldResumeSession
+      ? truncateDisplayId(
+          explicitResumeSessionDisplayId ??
+            taskSessionForRun?.sessionDisplayId ??
+            (sessionCodec.getDisplayId ? sessionCodec.getDisplayId(runtimeSessionParams) : null) ??
+            readNonEmptyString(runtimeSessionParams?.sessionId) ??
+            runtimeSessionFallback,
+        )
+      : null;
     let runtimeSessionIdForAdapter =
       readNonEmptyString(runtimeSessionParams?.sessionId) ?? runtimeSessionFallback;
     let runtimeSessionParamsForAdapter = runtimeSessionParams;
@@ -7051,13 +7065,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         }
       }
-      const nextSessionState = resolveNextSessionState({
-        codec: sessionCodec,
-        adapterResult,
-        previousParams: previousSessionParams,
-        previousDisplayId: runtimeForAdapter.sessionDisplayId,
-        previousLegacySessionId: runtimeForAdapter.sessionId,
-      });
+      const nextSessionState = adapterShouldPersistSession
+        ? resolveNextSessionState({
+            codec: sessionCodec,
+            adapterResult,
+            previousParams: previousSessionParams,
+            previousDisplayId: runtimeForAdapter.sessionDisplayId,
+            previousLegacySessionId: runtimeForAdapter.sessionId,
+          })
+        : {
+            params: null as Record<string, unknown> | null,
+            displayId: null as string | null,
+            legacySessionId: null as string | null,
+          };
       const rawUsage = normalizeUsageTotals(adapterResult.usage);
       const sessionUsageResolution = await resolveNormalizedUsageForSession({
         agentId: agent.id,
@@ -7325,19 +7345,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           timedOut: false,
           errorMessage: message,
         }, {
-          legacySessionId: runtimeForAdapter.sessionId,
+          legacySessionId: null,
         });
 
-        if (taskKey && (previousSessionParams || previousSessionDisplayId || taskSession)) {
-          await upsertTaskSession({
-            companyId: agent.companyId,
-            agentId: agent.id,
-            adapterType: agent.adapterType,
+        if (taskKey) {
+          await clearTaskSessions(agent.companyId, agent.id, {
             taskKey,
-            sessionParamsJson: previousSessionParams,
-            sessionDisplayId: previousSessionDisplayId,
-            lastRunId: failedRun.id,
-            lastError: message,
+            adapterType: agent.adapterType,
           });
         }
       }

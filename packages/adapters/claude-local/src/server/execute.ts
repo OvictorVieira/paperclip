@@ -1,7 +1,13 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
+import {
+  getSessionPolicy,
+  shouldPersistSession,
+  shouldResumeSession,
+  type AdapterExecutionContext,
+  type AdapterExecutionResult,
+} from "@paperclipai/adapter-utils";
 import type { RunProcessResult } from "@paperclipai/adapter-utils/server-utils";
 import {
   adapterExecutionTargetIsRemote,
@@ -39,6 +45,8 @@ import {
   shapePaperclipWorkspaceEnvForExecution,
   stringifyPaperclipWakePayload,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
+  buildSessionPolicySummaryPrompt,
+  persistSessionPolicyHandoff,
 } from "@paperclipai/adapter-utils/server-utils";
 import { shellQuote } from "@paperclipai/adapter-utils/ssh";
 import {
@@ -330,6 +338,9 @@ export async function runClaudeLogin(input: {
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const { runId, agent, runtime, config, context, onLog, onMeta, onSpawn, authToken } = ctx;
+  const sessionPolicy = getSessionPolicy(config);
+  const resumeSessionEnabled = shouldResumeSession(config);
+  const persistSessionEnabled = shouldPersistSession(config);
   const executionTarget = readAdapterExecutionTarget({
     executionTarget: ctx.executionTarget,
     legacyRemoteExecution: ctx.executionTransport?.remoteExecution,
@@ -532,8 +543,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     hasMatchingPromptBundle &&
     (runtimeSessionCwd.length === 0 || path.resolve(runtimeSessionCwd) === path.resolve(effectiveExecutionCwd)) &&
     adapterExecutionTargetSessionMatches(runtimeRemoteExecution, executionTarget);
-  const sessionId = canResumeSession ? runtimeSessionId : null;
-  if (
+  const sessionId = resumeSessionEnabled && canResumeSession ? runtimeSessionId : null;
+  if (runtimeSessionId && !resumeSessionEnabled) {
+    await onLog(
+      "stdout",
+      `[paperclip] Claude session policy "${sessionPolicy}" disables saved session resume. Starting a fresh session.\n`,
+    );
+  } else if (
     executionTargetIsRemote &&
     runtimeSessionId &&
     !canResumeSession
@@ -581,11 +597,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const shouldUseResumeDeltaPrompt = Boolean(sessionId) && wakePrompt.length > 0;
   const renderedPrompt = shouldUseResumeDeltaPrompt ? "" : renderTemplate(promptTemplate, templateData);
   const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
+  const sessionPolicySummaryPrompt =
+    sessionPolicy === "summarized"
+      ? await buildSessionPolicySummaryPrompt({ cwd, adapterConfig: config })
+      : "";
   const taskContextNote = asString(context.paperclipTaskMarkdown, "").trim();
   const prompt = joinPromptSections([
     renderedBootstrapPrompt,
     wakePrompt,
     sessionHandoffNote,
+    sessionPolicySummaryPrompt,
     taskContextNote,
     renderedPrompt,
   ]);
@@ -594,6 +615,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     bootstrapPromptChars: renderedBootstrapPrompt.length,
     wakePromptChars: wakePrompt.length,
     sessionHandoffChars: sessionHandoffNote.length,
+    sessionPolicySummaryChars: sessionPolicySummaryPrompt.length,
     taskContextChars: taskContextNote.length,
     heartbeatPromptChars: renderedPrompt.length,
   };
@@ -715,7 +737,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         errorMessage: `Timed out after ${timeoutSec}s`,
         errorCode: "timeout",
         errorMeta,
-        clearSession: Boolean(opts.clearSessionOnMissingSession),
+        clearSession: !persistSessionEnabled || Boolean(opts.clearSessionOnMissingSession),
       };
     }
 
@@ -763,7 +785,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() }
             : {}),
         },
-        clearSession: Boolean(opts.clearSessionOnMissingSession),
+        clearSession: !persistSessionEnabled || Boolean(opts.clearSessionOnMissingSession),
       };
     }
 
@@ -778,9 +800,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         };
       })();
 
-    const resolvedSessionId =
-      parsedStream.sessionId ??
-      (asString(parsed.session_id, opts.fallbackSessionId ?? "") || opts.fallbackSessionId);
+    const resolvedSessionId = persistSessionEnabled
+      ? parsedStream.sessionId ??
+        (asString(parsed.session_id, opts.fallbackSessionId ?? "") || opts.fallbackSessionId)
+      : null;
     const resolvedSessionParams = resolvedSessionId
       ? ({
         sessionId: resolvedSessionId,
@@ -855,12 +878,35 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       costUsd: parsedStream.costUsd ?? asNumber(parsed.total_cost_usd, 0),
       resultJson: mergedResultJson,
       summary: parsedStream.summary || asString(parsed.result, ""),
-      clearSession: clearSessionForMaxTurns || Boolean(opts.clearSessionOnMissingSession && !resolvedSessionId),
+      clearSession: !persistSessionEnabled || clearSessionForMaxTurns || Boolean(opts.clearSessionOnMissingSession && !resolvedSessionId),
+    };
+  };
+  let sessionPolicyHandoff: {
+    summary?: string | null;
+    stdout?: string | null;
+    stderr?: string | null;
+    exitCode?: number | null;
+    signal?: string | null;
+    errorMessage?: string | null;
+  } | null = null;
+  const rememberSessionPolicyHandoff = (attempt: {
+    proc: RunProcessResult;
+    parsedStream: ReturnType<typeof parseClaudeStreamJson>;
+    parsed: Record<string, unknown> | null;
+  }) => {
+    sessionPolicyHandoff = {
+      summary: attempt.parsedStream.summary || asString(attempt.parsed?.result, ""),
+      stdout: attempt.proc.stdout,
+      stderr: attempt.proc.stderr,
+      exitCode: attempt.proc.exitCode,
+      signal: attempt.proc.signal,
+      errorMessage: attempt.parsed ? describeClaudeFailure(attempt.parsed) : parseFallbackErrorMessage(attempt.proc),
     };
   };
 
   try {
     const initial = await runAttempt(sessionId ?? null);
+    rememberSessionPolicyHandoff(initial);
     if (
       sessionId &&
       !initial.proc.timedOut &&
@@ -873,20 +919,42 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         `[paperclip] Claude resume session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
       );
       const retry = await runAttempt(null);
+      rememberSessionPolicyHandoff(retry);
       return toAdapterResult(retry, { fallbackSessionId: null, clearSessionOnMissingSession: true });
     }
 
-    return toAdapterResult(initial, { fallbackSessionId: runtimeSessionId || runtime.sessionId });
+    return toAdapterResult(initial, { fallbackSessionId: persistSessionEnabled ? runtimeSessionId || runtime.sessionId : null });
   } finally {
     if (paperclipBridge) {
-      await paperclipBridge.stop();
+      try {
+        await paperclipBridge.stop();
+      } catch (err) {
+        await onLog("stderr", `[paperclip] Failed to stop callback bridge: ${err instanceof Error ? err.message : String(err)}\n`);
+      }
     }
     if (restoreRemoteWorkspace) {
-      await onLog(
-        "stdout",
-        `[paperclip] Restoring workspace changes from ${describeAdapterExecutionTarget(executionTarget)}.\n`,
-      );
-      await restoreRemoteWorkspace();
+      try {
+        await onLog(
+          "stdout",
+          `[paperclip] Restoring workspace changes from ${describeAdapterExecutionTarget(executionTarget)}.\n`,
+        );
+        await restoreRemoteWorkspace();
+      } catch (err) {
+        await onLog("stderr", `[paperclip] Failed to restore workspace changes: ${err instanceof Error ? err.message : String(err)}\n`);
+      }
+    }
+    if (sessionPolicy === "summarized") {
+      try {
+        await persistSessionPolicyHandoff({
+          cwd,
+          adapterConfig: config,
+          runId,
+          ...(sessionPolicyHandoff ?? {}),
+          onLog,
+        });
+      } catch (err) {
+        await onLog("stderr", `[paperclip] Failed to persist session handoff: ${err instanceof Error ? err.message : String(err)}\n`);
+      }
     }
   }
 }

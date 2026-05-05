@@ -467,6 +467,7 @@ export interface CreateConfigValues {
   adapterType: string;
   cwd: string;
   instructionsFilePath?: string;
+  sessionPolicy?: "resume" | "fresh" | "summarized";
   promptTemplate: string;
   model: string;
   thinkingEffort: string;

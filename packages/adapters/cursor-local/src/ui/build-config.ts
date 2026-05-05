@@ -61,6 +61,7 @@ export function buildCursorLocalConfig(v: CreateConfigValues): Record<string, un
   const ac: Record<string, unknown> = {};
   if (v.cwd) ac.cwd = v.cwd;
   if (v.instructionsFilePath) ac.instructionsFilePath = v.instructionsFilePath;
+  if (v.sessionPolicy && v.sessionPolicy !== "resume") ac.sessionPolicy = v.sessionPolicy;
   ac.model = v.model || DEFAULT_CURSOR_LOCAL_MODEL;
   const mode = normalizeMode(v.thinkingEffort);
   if (mode) ac.mode = mode;

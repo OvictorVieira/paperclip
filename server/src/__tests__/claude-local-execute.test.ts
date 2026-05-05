@@ -261,6 +261,37 @@ describe("claude execute", () => {
     }
   });
 
+  it("fresh session policy skips --resume and does not persist a new Claude session", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-exec-fresh-policy-"));
+    const { workspace, commandPath, capturePath, restore } = await setupExecuteEnv(root);
+    try {
+      const result = await execute({
+        runId: "run-fresh-policy",
+        agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: {} },
+        runtime: { sessionId: "claude-session-old", sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: {
+          command: commandPath,
+          cwd: workspace,
+          sessionPolicy: "fresh",
+          env: { PAPERCLIP_TEST_CAPTURE_PATH: capturePath },
+          promptTemplate: "Do work.",
+        },
+        context: {},
+        authToken: "tok",
+        onLog: async () => {},
+        onMeta: async () => {},
+      });
+      const captured = JSON.parse(await fs.readFile(capturePath, "utf-8")) as CapturePayload;
+      expect(captured.argv).not.toContain("--resume");
+      expect(result.sessionId).toBeNull();
+      expect(result.sessionParams).toBeNull();
+      expect(result.clearSession).toBe(true);
+    } finally {
+      restore();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   /**
    * Regression tests for commandNotes accuracy (Greptile P2).
    *

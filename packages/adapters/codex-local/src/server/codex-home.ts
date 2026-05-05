@@ -38,6 +38,10 @@ export function resolveManagedCodexHomeDir(
     : path.resolve(paperclipHome, "instances", instanceId, "codex-home");
 }
 
+function sanitizePathSegment(value: string): string {
+  return value.replace(/[^a-zA-Z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "run";
+}
+
 async function ensureParentDir(target: string): Promise<void> {
   await fs.mkdir(path.dirname(target), { recursive: true });
 }
@@ -84,6 +88,35 @@ export async function writeApiKeyAuthJson(home: string, apiKey: string): Promise
   await fs.writeFile(target, JSON.stringify({ OPENAI_API_KEY: apiKey }), { mode: 0o600 });
 }
 
+async function seedCodexHomeFromSource(input: {
+  targetHome: string;
+  sourceHome: string;
+  onLog: AdapterExecutionContext["onLog"];
+  env: NodeJS.ProcessEnv;
+}): Promise<void> {
+  const { targetHome, sourceHome, onLog, env } = input;
+  if (path.resolve(sourceHome) === path.resolve(targetHome)) return;
+
+  await fs.mkdir(targetHome, { recursive: true });
+
+  for (const name of SYMLINKED_SHARED_FILES) {
+    const source = path.join(sourceHome, name);
+    if (!(await pathExists(source))) continue;
+    await ensureSymlink(path.join(targetHome, name), source);
+  }
+
+  for (const name of COPIED_SHARED_FILES) {
+    const source = path.join(sourceHome, name);
+    if (!(await pathExists(source))) continue;
+    await ensureCopiedFile(path.join(targetHome, name), source);
+  }
+
+  await onLog(
+    "stdout",
+    `[paperclip] Using ${isWorktreeMode(env) ? "worktree-isolated" : "Paperclip-managed"} Codex home "${targetHome}" (seeded from "${sourceHome}").\n`,
+  );
+}
+
 export async function prepareManagedCodexHome(
   env: NodeJS.ProcessEnv,
   onLog: AdapterExecutionContext["onLog"],
@@ -91,42 +124,24 @@ export async function prepareManagedCodexHome(
   options: { apiKey?: string | null } = {},
 ): Promise<string> {
   const targetHome = resolveManagedCodexHomeDir(env, companyId);
-  const apiKey = nonEmpty(options.apiKey ?? undefined);
-
   const sourceHome = resolveSharedCodexHomeDir(env);
   const seedFromShared = path.resolve(sourceHome) !== path.resolve(targetHome);
-
-  await fs.mkdir(targetHome, { recursive: true });
-
-  // If a previous run wrote an apikey-mode auth.json (regular file) and this
-  // run has no apiKey, remove it so the chatgpt-mode symlink can be restored.
-  // Without this cleanup, ensureSymlink bails on a non-symlink and Codex keeps
-  // authenticating with the stale key after it is removed from configuration.
-  if (!apiKey && seedFromShared) {
-    const authPath = path.join(targetHome, "auth.json");
-    const existing = await fs.lstat(authPath).catch(() => null);
-    if (existing && !existing.isSymbolicLink()) {
-      await fs.rm(authPath, { force: true });
-    }
-  }
+  const apiKey = nonEmpty(options.apiKey ?? undefined);
 
   if (seedFromShared) {
-    for (const name of SYMLINKED_SHARED_FILES) {
-      const source = path.join(sourceHome, name);
-      if (!(await pathExists(source))) continue;
-      await ensureSymlink(path.join(targetHome, name), source);
+    // If a previous run wrote an apikey-mode auth.json (regular file) and this
+    // run has no apiKey, remove it so the chatgpt-mode symlink can be restored.
+    // Without this cleanup, ensureSymlink bails on a non-symlink and Codex keeps
+    // authenticating with the stale key after it is removed from configuration.
+    if (!apiKey) {
+      const authPath = path.join(targetHome, "auth.json");
+      const existing = await fs.lstat(authPath).catch(() => null);
+      if (existing && !existing.isSymbolicLink()) {
+        await fs.rm(authPath, { force: true });
+      }
     }
 
-    for (const name of COPIED_SHARED_FILES) {
-      const source = path.join(sourceHome, name);
-      if (!(await pathExists(source))) continue;
-      await ensureCopiedFile(path.join(targetHome, name), source);
-    }
-
-    await onLog(
-      "stdout",
-      `[paperclip] Using ${isWorktreeMode(env) ? "worktree-isolated" : "Paperclip-managed"} Codex home "${targetHome}" (seeded from "${sourceHome}").\n`,
-    );
+    await seedCodexHomeFromSource({ targetHome, sourceHome, onLog, env });
   }
 
   if (apiKey) {
@@ -137,5 +152,39 @@ export async function prepareManagedCodexHome(
     );
   }
 
+  return targetHome;
+}
+
+export async function prepareIsolatedCodexHome(input: {
+  env: NodeJS.ProcessEnv;
+  onLog: AdapterExecutionContext["onLog"];
+  companyId?: string;
+  runId: string;
+  sourceHome: string;
+  apiKey?: string | null;
+}): Promise<string> {
+  const managedHome = resolveManagedCodexHomeDir(input.env, input.companyId);
+  const targetHome = path.resolve(
+    path.dirname(managedHome),
+    "codex-home-runs",
+    sanitizePathSegment(input.runId),
+  );
+
+  await seedCodexHomeFromSource({
+    targetHome,
+    sourceHome: input.sourceHome,
+    onLog: input.onLog,
+    env: input.env,
+  });
+
+  const apiKey = nonEmpty(input.apiKey ?? undefined);
+  if (apiKey) {
+    await writeApiKeyAuthJson(targetHome, apiKey);
+  }
+
+  await input.onLog(
+    "stdout",
+    `[paperclip] Using isolated Codex home "${targetHome}" (seeded from "${input.sourceHome}").\n`,
+  );
   return targetHome;
 }

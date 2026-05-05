@@ -38,6 +38,10 @@ Core fields:
 - effort (string, optional): reasoning effort passed via --effort (low|medium|high)
 - chrome (boolean, optional): pass --chrome when running Claude
 - promptTemplate (string, optional): run prompt template
+- sessionPolicy ("resume"|"fresh"|"summarized", optional): default resume; fresh/summarized never pass --resume or persist new session ids
+- summaryFile (string, optional): summarized policy handoff file, defaults to .paperclip-agent/NEXT_CONTEXT.md
+- progressFile (string, optional): summarized policy progress file, defaults to .paperclip-agent/PROGRESS.md
+- maxSummaryTokens (number, optional): summarized policy summary budget, defaults to 2000
 - maxTurnsPerRun (number, optional): max turns for one run
 - dangerouslySkipPermissions (boolean, optional, default true): pass --dangerously-skip-permissions to claude; defaults to true because Paperclip runs Claude in headless --print mode where interactive permission prompts cannot be answered
 - command (string, optional): defaults to "claude"

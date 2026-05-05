@@ -88,6 +88,10 @@ Core fields:
 - cwd (string, optional): default absolute working directory fallback for the agent process (created if missing when possible)
 - instructionsFilePath (string, optional): absolute path to a markdown instructions file prepended to the run prompt
 - promptTemplate (string, optional): run prompt template
+- sessionPolicy ("resume"|"fresh"|"summarized", optional): default resume; fresh/summarized never pass --resume or persist new session ids
+- summaryFile (string, optional): summarized policy handoff file, defaults to .paperclip-agent/NEXT_CONTEXT.md
+- progressFile (string, optional): summarized policy progress file, defaults to .paperclip-agent/PROGRESS.md
+- maxSummaryTokens (number, optional): summarized policy summary budget, defaults to 2000
 - model (string, optional): Cursor model id (for example auto or gpt-5.3-codex)
 - mode (string, optional): Cursor execution mode passed as --mode (plan|ask). Leave unset for normal autonomous runs.
 - command (string, optional): defaults to "agent"

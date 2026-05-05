@@ -78,6 +78,10 @@ export const MAX_CAPTURE_BYTES = 4 * 1024 * 1024;
 export const MAX_EXCERPT_BYTES = 32 * 1024;
 const TERMINAL_RESULT_SCAN_OVERLAP_CHARS = 64 * 1024;
 const SENSITIVE_ENV_KEY = /(key|token|secret|password|passwd|authorization|cookie)/i;
+const DEFAULT_SESSION_SUMMARY_FILE = ".paperclip-agent/NEXT_CONTEXT.md";
+const DEFAULT_SESSION_PROGRESS_FILE = ".paperclip-agent/PROGRESS.md";
+const DEFAULT_MAX_SUMMARY_CHARS = 8_000;
+const DEFAULT_PROGRESS_HISTORY_CHARS = 24_000;
 const REDACTED_LOG_VALUE = "***REDACTED***";
 const PAPERCLIP_SKILL_ROOT_RELATIVE_CANDIDATES = [
   "../../skills",
@@ -208,6 +212,192 @@ export function asBoolean(value: unknown, fallback: boolean): boolean {
 
 export function asStringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+function resolveWorkspaceRelativePath(cwd: string, value: string, fallback: string): string {
+  const raw = value.trim() || fallback;
+  const root = path.resolve(cwd);
+  const resolved = path.resolve(root, raw);
+  const relative = path.relative(root, resolved);
+  if (
+    path.isAbsolute(raw) ||
+    relative === ".." ||
+    relative.startsWith(`..${path.sep}`) ||
+    path.isAbsolute(relative)
+  ) {
+    throw new Error(`Session handoff paths must stay inside the workspace: "${raw}"`);
+  }
+  return resolved;
+}
+
+function truncateSummaryText(text: string, maxSummaryTokens: number): string {
+  const maxChars = maxSummaryTokens > 0 ? Math.max(1_000, maxSummaryTokens * 4) : DEFAULT_MAX_SUMMARY_CHARS;
+  if (text.length <= maxChars) return text;
+  return text.slice(text.length - maxChars);
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function firstUsefulExcerpt(...values: Array<string | null | undefined>): string {
+  for (const value of values) {
+    const trimmed = typeof value === "string" ? value.trim() : "";
+    if (trimmed.length > 0) return trimmed;
+  }
+  return "";
+}
+
+export async function persistSessionPolicyHandoff(input: {
+  cwd: string;
+  adapterConfig: unknown;
+  runId?: string | null;
+  summary?: string | null;
+  stdout?: string | null;
+  stderr?: string | null;
+  exitCode?: number | null;
+  signal?: string | null;
+  errorMessage?: string | null;
+  onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+}): Promise<void> {
+  const config = parseObject(input.adapterConfig);
+  const summaryFile = asString(config.summaryFile, DEFAULT_SESSION_SUMMARY_FILE);
+  const progressFile = asString(config.progressFile, DEFAULT_SESSION_PROGRESS_FILE);
+  const maxSummaryTokens = asNumber(config.maxSummaryTokens, 2_000);
+  const summaryPath = resolveWorkspaceRelativePath(input.cwd, summaryFile, DEFAULT_SESSION_SUMMARY_FILE);
+  const progressPath = resolveWorkspaceRelativePath(input.cwd, progressFile, DEFAULT_SESSION_PROGRESS_FILE);
+  const maxChars = maxSummaryTokens > 0 ? Math.max(1_000, maxSummaryTokens * 4) : DEFAULT_MAX_SUMMARY_CHARS;
+  const excerpt = truncateSummaryText(
+    firstUsefulExcerpt(input.summary, input.stderr, input.stdout, input.errorMessage),
+    maxSummaryTokens,
+  );
+  const runLabel = input.runId ? `Run: ${input.runId}` : "Run: unknown";
+  const statusParts = [
+    input.exitCode === undefined ? "" : `exitCode=${input.exitCode ?? "null"}`,
+    input.signal ? `signal=${input.signal}` : "",
+    input.errorMessage ? `error=${input.errorMessage}` : "",
+  ].filter(Boolean);
+  const status = statusParts.length > 0 ? statusParts.join(" ") : "status=unknown";
+  const summaryBody = excerpt || "No model summary captured before interruption. Inspect git status and workspace files.";
+  const hasNewHandoffContent =
+    excerpt.length > 0 ||
+    input.exitCode !== undefined ||
+    Boolean(input.signal) ||
+    Boolean(input.errorMessage);
+  const headerAndGoal = [
+    "# Next Context",
+    "",
+    `Updated: ${nowIso()}`,
+    runLabel,
+    `Status: ${status}`,
+    "",
+    "Current goal:",
+    "- Continue current Paperclip issue from workspace state.",
+    "",
+    "Completed work:",
+  ].join("\n");
+  const filesChangedAndFooter = [
+    "",
+    "Files changed:",
+    "- Inspect `git status`.",
+    "",
+    "Known blockers:",
+    input.errorMessage ? `- ${input.errorMessage}` : "- None recorded.",
+    "",
+    "Next action:",
+    `- Read \`${progressFile}\`, inspect \`git status\`, continue next unfinished unit.`,
+  ].join("\n");
+
+  const allowedBodyChars = maxChars - headerAndGoal.length - filesChangedAndFooter.length - 2;
+  const truncatedBody =
+    summaryBody.length > allowedBodyChars
+      ? summaryBody.slice(0, Math.max(0, allowedBodyChars))
+      : summaryBody;
+
+  const nextContext = [headerAndGoal, truncatedBody, filesChangedAndFooter].join("\n");
+  const progressEntry = [
+    `## ${nowIso()}`,
+    runLabel,
+    `Status: ${status}`,
+    "",
+    summaryBody,
+    "",
+  ].join("\n");
+
+  try {
+    const summaryExists = await fs.access(summaryPath).then(() => true).catch(() => false);
+    const shouldWriteSummary = hasNewHandoffContent || !summaryExists;
+    if (shouldWriteSummary) {
+      await fs.mkdir(path.dirname(summaryPath), { recursive: true });
+      await fs.writeFile(summaryPath, nextContext, "utf8");
+    }
+    await fs.mkdir(path.dirname(progressPath), { recursive: true });
+    const previousProgress = await fs.readFile(progressPath, "utf8").catch(() => "");
+    const nextProgress = `${previousProgress.trim() ? `${previousProgress.trim()}\n\n` : ""}${progressEntry}`;
+    await fs.mkdir(path.dirname(progressPath), { recursive: true });
+    await fs.writeFile(
+      progressPath,
+      nextProgress.length > DEFAULT_PROGRESS_HISTORY_CHARS
+        ? nextProgress.slice(nextProgress.length - DEFAULT_PROGRESS_HISTORY_CHARS)
+        : nextProgress,
+      "utf8",
+    );
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    await input.onLog?.("stderr", `[paperclip] Failed to persist session handoff: ${reason}\n`);
+  }
+}
+
+export async function buildSessionPolicySummaryPrompt(input: {
+  cwd: string;
+  adapterConfig: unknown;
+}): Promise<string> {
+  const config = parseObject(input.adapterConfig);
+  const summaryFile = asString(config.summaryFile, DEFAULT_SESSION_SUMMARY_FILE);
+  const progressFile = asString(config.progressFile, DEFAULT_SESSION_PROGRESS_FILE);
+  const maxSummaryTokens = asNumber(config.maxSummaryTokens, 2_000);
+  const summaryPath = resolveWorkspaceRelativePath(input.cwd, summaryFile, DEFAULT_SESSION_SUMMARY_FILE);
+  const progressPath = resolveWorkspaceRelativePath(input.cwd, progressFile, DEFAULT_SESSION_PROGRESS_FILE);
+  const [summary, progress] = await Promise.all([
+    fs.readFile(summaryPath, "utf8").catch(() => ""),
+    fs.readFile(progressPath, "utf8").catch(() => ""),
+  ]);
+  const summaryText = truncateSummaryText(summary.trim(), maxSummaryTokens);
+  const progressText = truncateSummaryText(progress.trim(), maxSummaryTokens);
+
+  return [
+    "# Session Policy",
+    "",
+    "You are running in a fresh disposable session.",
+    "",
+    "Do not rely on previous chat/session memory.",
+    "",
+    "At the start:",
+    `1. Read \`${summaryFile}\` if it exists.`,
+    `2. Read \`${progressFile}\` if it exists.`,
+    "3. Inspect `git status`.",
+    "4. Continue only the next unfinished unit of work.",
+    "",
+    "Previous handoff summary:",
+    "",
+    summaryText || "(empty)",
+    "",
+    "Previous progress:",
+    "",
+    progressText || "(empty)",
+    "",
+    "At the end of the run:",
+    `1. Update \`${progressFile}\`.`,
+    `2. Update \`${summaryFile}\`.`,
+    `3. Keep \`${summaryFile}\` concise.`,
+    "4. Include only:",
+    "   - current goal;",
+    "   - completed work;",
+    "   - files changed;",
+    "   - known blockers;",
+    "   - next action.",
+    "5. Do not include full logs, full diffs, dependency dumps or repeated instructions.",
+  ].join("\n");
 }
 
 export function parseJson(value: string): Record<string, unknown> | null {

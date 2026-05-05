@@ -8,6 +8,7 @@ import {
 } from "../../components/agent-config-primitives";
 import { ChoosePathButton } from "../../components/PathInstructionsModal";
 import { LocalWorkspaceRuntimeFields } from "../local-workspace-runtime-fields";
+import { SessionPolicyField } from "../session-policy-field";
 
 const inputClass =
   "w-full rounded-md border border-border px-2.5 py-1.5 bg-transparent outline-none text-sm font-mono placeholder:text-muted-foreground/40";
@@ -65,6 +66,14 @@ export function ClaudeLocalConfigFields({
         mode={mode}
         adapterType={adapterType}
         models={models}
+      />
+      <SessionPolicyField
+        isCreate={isCreate}
+        values={values}
+        set={set}
+        config={config}
+        mark={mark}
+        eff={eff}
       />
     </>
   );

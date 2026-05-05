@@ -3,7 +3,13 @@ import type { Dirent } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
+import {
+  getSessionPolicy,
+  shouldPersistSession,
+  shouldResumeSession,
+  type AdapterExecutionContext,
+  type AdapterExecutionResult,
+} from "@paperclipai/adapter-utils";
 import {
   adapterExecutionTargetIsRemote,
   adapterExecutionTargetRemoteCwd,
@@ -44,6 +50,8 @@ import {
   stringifyPaperclipWakePayload,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   runChildProcess,
+  buildSessionPolicySummaryPrompt,
+  persistSessionPolicyHandoff,
 } from "@paperclipai/adapter-utils/server-utils";
 import { DEFAULT_GEMINI_LOCAL_MODEL, SANDBOX_INSTALL_COMMAND } from "../index.js";
 import {
@@ -171,6 +179,9 @@ async function buildGeminiSkillsDir(
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const { runId, agent, runtime, config, context, onLog, onMeta, onSpawn, authToken } = ctx;
+  const sessionPolicy = getSessionPolicy(config);
+  const resumeSessionEnabled = shouldResumeSession(config);
+  const persistSessionEnabled = shouldPersistSession(config);
   const executionTarget = readAdapterExecutionTarget({
     executionTarget: ctx.executionTarget,
     legacyRemoteExecution: ctx.executionTransport?.remoteExecution,
@@ -389,8 +400,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     runtimeSessionId.length > 0 &&
     (runtimeSessionCwd.length === 0 || path.resolve(runtimeSessionCwd) === path.resolve(effectiveExecutionCwd)) &&
     adapterExecutionTargetSessionMatches(runtimeRemoteExecution, executionTarget);
-  const sessionId = canResumeSession ? runtimeSessionId : null;
-  if (executionTargetIsRemote && runtimeSessionId && !canResumeSession) {
+  const sessionId = resumeSessionEnabled && canResumeSession ? runtimeSessionId : null;
+  if (runtimeSessionId && !resumeSessionEnabled) {
+    await onLog(
+      "stdout",
+      `[paperclip] Gemini session policy "${sessionPolicy}" disables saved session resume. Starting a fresh session.\n`,
+    );
+  } else if (executionTargetIsRemote && runtimeSessionId && !canResumeSession) {
     await onLog(
       "stdout",
       `[paperclip] Gemini session "${runtimeSessionId}" does not match the current remote execution identity and will not be resumed in "${effectiveExecutionCwd}". Starting a fresh remote session.\n`,
@@ -455,6 +471,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const shouldUseResumeDeltaPrompt = Boolean(sessionId) && wakePrompt.length > 0;
   const renderedPrompt = shouldUseResumeDeltaPrompt ? "" : renderTemplate(promptTemplate, templateData);
   const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
+  const sessionPolicySummaryPrompt =
+    sessionPolicy === "summarized"
+      ? await buildSessionPolicySummaryPrompt({ cwd, adapterConfig: config })
+      : "";
   const paperclipEnvNote = renderPaperclipEnvNote(env);
   const apiAccessNote = renderApiAccessNote(env);
   const prompt = joinPromptSections([
@@ -462,6 +482,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     renderedBootstrapPrompt,
     wakePrompt,
     sessionHandoffNote,
+    sessionPolicySummaryPrompt,
     paperclipEnvNote,
     apiAccessNote,
     renderedPrompt,
@@ -472,6 +493,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     bootstrapPromptChars: renderedBootstrapPrompt.length,
     wakePromptChars: wakePrompt.length,
     sessionHandoffChars: sessionHandoffNote.length,
+    sessionPolicySummaryChars: sessionPolicySummaryPrompt.length,
     runtimeNoteChars: paperclipEnvNote.length + apiAccessNote.length,
     heartbeatPromptChars: renderedPrompt.length,
   };
@@ -550,7 +572,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         timedOut: true,
         errorMessage: `Timed out after ${timeoutSec}s`,
         errorCode: authMeta.requiresAuth ? "gemini_auth_required" : null,
-        clearSession: clearSessionOnMissingSession,
+        clearSession: !persistSessionEnabled || clearSessionOnMissingSession,
       };
     }
 
@@ -571,8 +593,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     );
 
     // On retry, don't fall back to old session ID — the old session was stale
-    const canFallbackToRuntimeSession = !isRetry;
-    const resolvedSessionId = attempt.parsed.sessionId
+    const canFallbackToRuntimeSession = persistSessionEnabled && !isRetry;
+    const resolvedSessionId = (persistSessionEnabled ? attempt.parsed.sessionId : null)
       ?? (canFallbackToRuntimeSession ? (runtimeSessionId ?? runtime.sessionId ?? null) : null);
     const resolvedSessionParams = resolvedSessionId
       ? ({
@@ -618,12 +640,33 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       resultJson,
       summary: attempt.parsed.summary,
       question: attempt.parsed.question,
-      clearSession: clearSessionForTurnLimit || Boolean(clearSessionOnMissingSession && !resolvedSessionId),
+      clearSession: !persistSessionEnabled || clearSessionForTurnLimit || Boolean(clearSessionOnMissingSession && !resolvedSessionId),
+    };
+  };
+  let sessionPolicyHandoff: {
+    summary?: string | null;
+    stdout?: string | null;
+    stderr?: string | null;
+    exitCode?: number | null;
+    signal?: string | null;
+    errorMessage?: string | null;
+  } | null = null;
+  const rememberSessionPolicyHandoff = (
+    attempt: { proc: { exitCode: number | null; signal: string | null; stdout: string; stderr: string }; parsed: ReturnType<typeof parseGeminiJsonl> },
+  ) => {
+    sessionPolicyHandoff = {
+      summary: attempt.parsed.summary,
+      stdout: attempt.proc.stdout,
+      stderr: attempt.proc.stderr,
+      exitCode: attempt.proc.exitCode,
+      signal: attempt.proc.signal,
+      errorMessage: attempt.parsed.errorMessage ?? firstNonEmptyLine(attempt.proc.stderr) ?? null,
     };
   };
 
   try {
     const initial = await runAttempt(sessionId);
+    rememberSessionPolicyHandoff(initial);
     if (
       sessionId &&
       !initial.proc.timedOut &&
@@ -635,15 +678,49 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         `[paperclip] Gemini resume session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
       );
       const retry = await runAttempt(null);
+      rememberSessionPolicyHandoff(retry);
       return toResult(retry, true, true);
     }
 
     return toResult(initial);
   } finally {
-    await Promise.all([
-      paperclipBridge?.stop(),
-      restoreRemoteWorkspace?.(),
-      localSkillsDir ? fs.rm(path.dirname(localSkillsDir), { recursive: true, force: true }).catch(() => undefined) : Promise.resolve(),
-    ]);
+    if (paperclipBridge) {
+      try {
+        await paperclipBridge.stop();
+      } catch (err) {
+        await onLog("stderr", `[paperclip] Failed to stop callback bridge: ${err instanceof Error ? err.message : String(err)}\n`);
+      }
+    }
+    if (restoreRemoteWorkspace) {
+      try {
+        await onLog(
+          "stdout",
+          `[paperclip] Restoring workspace changes from ${describeAdapterExecutionTarget(executionTarget)}.\n`,
+        );
+        await restoreRemoteWorkspace();
+      } catch (err) {
+        await onLog("stderr", `[paperclip] Failed to restore workspace changes: ${err instanceof Error ? err.message : String(err)}\n`);
+      }
+    }
+    if (sessionPolicy === "summarized") {
+      try {
+        await persistSessionPolicyHandoff({
+          cwd,
+          adapterConfig: config,
+          runId,
+          ...(sessionPolicyHandoff ?? {}),
+          onLog,
+        });
+      } catch (err) {
+        await onLog("stderr", `[paperclip] Failed to persist session handoff: ${err instanceof Error ? err.message : String(err)}\n`);
+      }
+    }
+    if (localSkillsDir) {
+      try {
+        await fs.rm(path.dirname(localSkillsDir), { recursive: true, force: true });
+      } catch (err) {
+        await onLog("stderr", `[paperclip] Failed to remove temporary skills directory: ${err instanceof Error ? err.message : String(err)}\n`);
+      }
+    }
   }
 }
