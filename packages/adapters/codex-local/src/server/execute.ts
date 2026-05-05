@@ -371,6 +371,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           companyId: agent.companyId,
           runId,
           sourceHome: sharedEffectiveCodexHome,
+          apiKey: configuredOpenAiApiKey,
         })
       : sharedEffectiveCodexHome;
   await fs.mkdir(effectiveCodexHome, { recursive: true });
