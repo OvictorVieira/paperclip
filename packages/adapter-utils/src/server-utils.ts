@@ -216,8 +216,18 @@ export function asStringArray(value: unknown): string[] {
 
 function resolveWorkspaceRelativePath(cwd: string, value: string, fallback: string): string {
   const raw = value.trim() || fallback;
-  if (path.isAbsolute(raw)) return raw;
-  return path.resolve(cwd, raw);
+  const root = path.resolve(cwd);
+  const resolved = path.resolve(root, raw);
+  const relative = path.relative(root, resolved);
+  if (
+    path.isAbsolute(raw) ||
+    relative === ".." ||
+    relative.startsWith(`..${path.sep}`) ||
+    path.isAbsolute(relative)
+  ) {
+    throw new Error(`Session handoff paths must stay inside the workspace: "${raw}"`);
+  }
+  return resolved;
 }
 
 function truncateSummaryText(text: string, maxSummaryTokens: number): string {
@@ -269,6 +279,11 @@ export async function persistSessionPolicyHandoff(input: {
   ].filter(Boolean);
   const status = statusParts.length > 0 ? statusParts.join(" ") : "status=unknown";
   const summaryBody = excerpt || "No model summary captured before interruption. Inspect git status and workspace files.";
+  const hasNewHandoffContent =
+    excerpt.length > 0 ||
+    input.exitCode !== undefined ||
+    Boolean(input.signal) ||
+    Boolean(input.errorMessage);
   const headerAndGoal = [
     "# Next Context",
     "",
@@ -310,9 +325,13 @@ export async function persistSessionPolicyHandoff(input: {
   ].join("\n");
 
   try {
-    await fs.mkdir(path.dirname(summaryPath), { recursive: true });
+    const summaryExists = await fs.access(summaryPath).then(() => true).catch(() => false);
+    const shouldWriteSummary = hasNewHandoffContent || !summaryExists;
+    if (shouldWriteSummary) {
+      await fs.mkdir(path.dirname(summaryPath), { recursive: true });
+      await fs.writeFile(summaryPath, nextContext, "utf8");
+    }
     await fs.mkdir(path.dirname(progressPath), { recursive: true });
-    await fs.writeFile(summaryPath, nextContext, "utf8");
     const previousProgress = await fs.readFile(progressPath, "utf8").catch(() => "");
     const nextProgress = `${previousProgress.trim() ? `${previousProgress.trim()}\n\n` : ""}${progressEntry}`;
     await fs.mkdir(path.dirname(progressPath), { recursive: true });

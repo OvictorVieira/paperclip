@@ -39,7 +39,7 @@ export function resolveManagedCodexHomeDir(
 }
 
 function sanitizePathSegment(value: string): string {
-  return value.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "run";
+  return value.replace(/[^a-zA-Z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "run";
 }
 
 async function ensureParentDir(target: string): Promise<void> {

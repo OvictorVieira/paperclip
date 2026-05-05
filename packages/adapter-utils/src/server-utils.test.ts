@@ -85,6 +85,41 @@ describe("buildSessionPolicySummaryPrompt", () => {
       await fs.rm(root, { recursive: true, force: true });
     }
   });
+
+  it("rejects handoff files outside the workspace", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-session-policy-"));
+    try {
+      await expect(
+        buildSessionPolicySummaryPrompt({
+          cwd: root,
+          adapterConfig: { sessionPolicy: "summarized", summaryFile: "../NEXT_CONTEXT.md" },
+        }),
+      ).rejects.toThrow(/inside the workspace/);
+
+      await expect(
+        buildSessionPolicySummaryPrompt({
+          cwd: root,
+          adapterConfig: { sessionPolicy: "summarized", progressFile: path.join(root, "PROGRESS.md") },
+        }),
+      ).rejects.toThrow(/inside the workspace/);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not create handoff directories while constructing the prompt", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-session-policy-"));
+    try {
+      await buildSessionPolicySummaryPrompt({
+        cwd: root,
+        adapterConfig: { sessionPolicy: "summarized" },
+      });
+
+      await expect(fs.access(path.join(root, ".paperclip-agent"))).rejects.toThrow();
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("persistSessionPolicyHandoff", () => {
@@ -105,6 +140,27 @@ describe("persistSessionPolicyHandoff", () => {
       expect(nextContext).toContain("Done: changed adapter. Next: run tests.");
       expect(nextContext).toContain("exitCode=1");
       expect(progress).toContain("Run: run-1");
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps an existing next-context file when no new handoff content exists", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-handoff-"));
+    try {
+      const summaryPath = path.join(root, ".paperclip-agent", "NEXT_CONTEXT.md");
+      await fs.mkdir(path.dirname(summaryPath), { recursive: true });
+      await fs.writeFile(summaryPath, "existing next action\n", "utf8");
+
+      await persistSessionPolicyHandoff({
+        cwd: root,
+        adapterConfig: { sessionPolicy: "summarized", maxSummaryTokens: 2_000 },
+        runId: "run-empty",
+      });
+
+      await expect(fs.readFile(summaryPath, "utf8")).resolves.toBe("existing next action\n");
+      const progress = await fs.readFile(path.join(root, ".paperclip-agent", "PROGRESS.md"), "utf8");
+      expect(progress).toContain("Run: run-empty");
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }

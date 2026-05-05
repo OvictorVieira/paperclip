@@ -6717,13 +6717,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
     const runtimeSessionFallback =
       !adapterShouldResumeSession || taskKey || resetTaskSession ? null : runtime.sessionId;
-    let previousSessionDisplayId = truncateDisplayId(
-      explicitResumeSessionDisplayId ??
-        taskSessionForRun?.sessionDisplayId ??
-        (sessionCodec.getDisplayId ? sessionCodec.getDisplayId(runtimeSessionParams) : null) ??
-        readNonEmptyString(runtimeSessionParams?.sessionId) ??
-        runtimeSessionFallback,
-    );
+    let previousSessionDisplayId = adapterShouldResumeSession
+      ? truncateDisplayId(
+          explicitResumeSessionDisplayId ??
+            taskSessionForRun?.sessionDisplayId ??
+            (sessionCodec.getDisplayId ? sessionCodec.getDisplayId(runtimeSessionParams) : null) ??
+            readNonEmptyString(runtimeSessionParams?.sessionId) ??
+            runtimeSessionFallback,
+        )
+      : null;
     let runtimeSessionIdForAdapter =
       readNonEmptyString(runtimeSessionParams?.sessionId) ?? runtimeSessionFallback;
     let runtimeSessionParamsForAdapter = runtimeSessionParams;

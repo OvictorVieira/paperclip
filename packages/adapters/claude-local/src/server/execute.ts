@@ -737,7 +737,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         errorMessage: `Timed out after ${timeoutSec}s`,
         errorCode: "timeout",
         errorMeta,
-        clearSession: Boolean(opts.clearSessionOnMissingSession),
+        clearSession: !persistSessionEnabled || Boolean(opts.clearSessionOnMissingSession),
       };
     }
 
@@ -785,7 +785,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() }
             : {}),
         },
-        clearSession: Boolean(opts.clearSessionOnMissingSession),
+        clearSession: !persistSessionEnabled || Boolean(opts.clearSessionOnMissingSession),
       };
     }
 
@@ -926,23 +926,35 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     return toAdapterResult(initial, { fallbackSessionId: persistSessionEnabled ? runtimeSessionId || runtime.sessionId : null });
   } finally {
     if (paperclipBridge) {
-      await paperclipBridge.stop();
+      try {
+        await paperclipBridge.stop();
+      } catch (err) {
+        await onLog("stderr", `[paperclip] Failed to stop callback bridge: ${err instanceof Error ? err.message : String(err)}\n`);
+      }
     }
     if (restoreRemoteWorkspace) {
-      await onLog(
-        "stdout",
-        `[paperclip] Restoring workspace changes from ${describeAdapterExecutionTarget(executionTarget)}.\n`,
-      );
-      await restoreRemoteWorkspace();
+      try {
+        await onLog(
+          "stdout",
+          `[paperclip] Restoring workspace changes from ${describeAdapterExecutionTarget(executionTarget)}.\n`,
+        );
+        await restoreRemoteWorkspace();
+      } catch (err) {
+        await onLog("stderr", `[paperclip] Failed to restore workspace changes: ${err instanceof Error ? err.message : String(err)}\n`);
+      }
     }
     if (sessionPolicy === "summarized") {
-      await persistSessionPolicyHandoff({
-        cwd,
-        adapterConfig: config,
-        runId,
-        ...(sessionPolicyHandoff ?? {}),
-        onLog,
-      });
+      try {
+        await persistSessionPolicyHandoff({
+          cwd,
+          adapterConfig: config,
+          runId,
+          ...(sessionPolicyHandoff ?? {}),
+          onLog,
+        });
+      } catch (err) {
+        await onLog("stderr", `[paperclip] Failed to persist session handoff: ${err instanceof Error ? err.message : String(err)}\n`);
+      }
     }
   }
 }
