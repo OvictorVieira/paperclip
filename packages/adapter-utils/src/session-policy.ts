@@ -16,6 +16,10 @@ export function shouldResumeSession(adapterConfig: unknown): boolean {
   return getSessionPolicy(adapterConfig) === "resume";
 }
 
+/**
+ * Intentionally mirrors shouldResumeSession: the "summarized" policy uses its
+ * own shouldInjectSummary gate for handoff persistence, rather than this flag.
+ */
 export function shouldPersistSession(adapterConfig: unknown): boolean {
   return getSessionPolicy(adapterConfig) === "resume";
 }

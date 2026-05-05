@@ -269,7 +269,7 @@ export async function persistSessionPolicyHandoff(input: {
   ].filter(Boolean);
   const status = statusParts.length > 0 ? statusParts.join(" ") : "status=unknown";
   const summaryBody = excerpt || "No model summary captured before interruption. Inspect git status and workspace files.";
-  const nextContext = [
+  const headerAndGoal = [
     "# Next Context",
     "",
     `Updated: ${nowIso()}`,
@@ -280,7 +280,8 @@ export async function persistSessionPolicyHandoff(input: {
     "- Continue current Paperclip issue from workspace state.",
     "",
     "Completed work:",
-    summaryBody,
+  ].join("\n");
+  const filesChangedAndFooter = [
     "",
     "Files changed:",
     "- Inspect `git status`.",
@@ -291,6 +292,14 @@ export async function persistSessionPolicyHandoff(input: {
     "Next action:",
     `- Read \`${progressFile}\`, inspect \`git status\`, continue next unfinished unit.`,
   ].join("\n");
+
+  const allowedBodyChars = maxChars - headerAndGoal.length - filesChangedAndFooter.length - 2;
+  const truncatedBody =
+    summaryBody.length > allowedBodyChars
+      ? summaryBody.slice(0, Math.max(0, allowedBodyChars))
+      : summaryBody;
+
+  const nextContext = [headerAndGoal, truncatedBody, filesChangedAndFooter].join("\n");
   const progressEntry = [
     `## ${nowIso()}`,
     runLabel,
@@ -303,9 +312,10 @@ export async function persistSessionPolicyHandoff(input: {
   try {
     await fs.mkdir(path.dirname(summaryPath), { recursive: true });
     await fs.mkdir(path.dirname(progressPath), { recursive: true });
-    await fs.writeFile(summaryPath, nextContext.slice(0, maxChars), "utf8");
+    await fs.writeFile(summaryPath, nextContext, "utf8");
     const previousProgress = await fs.readFile(progressPath, "utf8").catch(() => "");
     const nextProgress = `${previousProgress.trim() ? `${previousProgress.trim()}\n\n` : ""}${progressEntry}`;
+    await fs.mkdir(path.dirname(progressPath), { recursive: true });
     await fs.writeFile(
       progressPath,
       nextProgress.length > DEFAULT_PROGRESS_HISTORY_CHARS
@@ -329,8 +339,6 @@ export async function buildSessionPolicySummaryPrompt(input: {
   const maxSummaryTokens = asNumber(config.maxSummaryTokens, 2_000);
   const summaryPath = resolveWorkspaceRelativePath(input.cwd, summaryFile, DEFAULT_SESSION_SUMMARY_FILE);
   const progressPath = resolveWorkspaceRelativePath(input.cwd, progressFile, DEFAULT_SESSION_PROGRESS_FILE);
-  await fs.mkdir(path.dirname(summaryPath), { recursive: true }).catch(() => undefined);
-  await fs.mkdir(path.dirname(progressPath), { recursive: true }).catch(() => undefined);
   const [summary, progress] = await Promise.all([
     fs.readFile(summaryPath, "utf8").catch(() => ""),
     fs.readFile(progressPath, "utf8").catch(() => ""),

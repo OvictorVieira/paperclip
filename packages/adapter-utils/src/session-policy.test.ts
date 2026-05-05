@@ -16,8 +16,11 @@ describe("session policy helpers", () => {
   it("supports fresh and summarized non-resumable modes", () => {
     expect(shouldResumeSession({ sessionPolicy: "fresh" })).toBe(false);
     expect(shouldPersistSession({ sessionPolicy: "fresh" })).toBe(false);
+    expect(shouldInjectSummary({ sessionPolicy: "fresh" })).toBe(false);
     expect(shouldResumeSession({ sessionPolicy: "summarized" })).toBe(false);
     expect(shouldPersistSession({ sessionPolicy: "summarized" })).toBe(false);
     expect(shouldInjectSummary({ sessionPolicy: "summarized" })).toBe(true);
+    expect(shouldInjectSummary({ sessionPolicy: "resume" })).toBe(false);
+    expect(shouldInjectSummary({})).toBe(false);
   });
 });

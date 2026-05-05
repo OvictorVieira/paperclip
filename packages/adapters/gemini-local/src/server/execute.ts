@@ -684,6 +684,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     return toResult(initial);
   } finally {
+    if (paperclipBridge) {
+      await paperclipBridge.stop();
+    }
+    if (restoreRemoteWorkspace) {
+      await onLog(
+        "stdout",
+        `[paperclip] Restoring workspace changes from ${describeAdapterExecutionTarget(executionTarget)}.\n`,
+      );
+      await restoreRemoteWorkspace();
+    }
     if (sessionPolicy === "summarized") {
       await persistSessionPolicyHandoff({
         cwd,
@@ -693,10 +703,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         onLog,
       });
     }
-    await Promise.all([
-      paperclipBridge?.stop(),
-      restoreRemoteWorkspace?.(),
-      localSkillsDir ? fs.rm(path.dirname(localSkillsDir), { recursive: true, force: true }).catch(() => undefined) : Promise.resolve(),
-    ]);
+    if (localSkillsDir) {
+      await fs.rm(path.dirname(localSkillsDir), { recursive: true, force: true }).catch(() => undefined);
+    }
   }
 }

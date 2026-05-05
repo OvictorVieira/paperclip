@@ -39,7 +39,7 @@ export function resolveManagedCodexHomeDir(
 }
 
 function sanitizePathSegment(value: string): string {
-  return value.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "run";
+  return value.replace(/[^a-zA-Z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "run";
 }
 
 async function ensureParentDir(target: string): Promise<void> {
@@ -184,7 +184,7 @@ export async function prepareIsolatedCodexHome(input: {
 
   await input.onLog(
     "stdout",
-    `[paperclip] Using isolated Codex home "${targetHome}" for fresh session policy (seeded from "${input.sourceHome}").\n`,
+    `[paperclip] Using isolated Codex home "${targetHome}" (seeded from "${input.sourceHome}").\n`,
   );
   return targetHome;
 }

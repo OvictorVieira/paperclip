@@ -888,15 +888,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     return toResult(initial, false, false);
   } finally {
-    if (sessionPolicy === "summarized") {
-      await persistSessionPolicyHandoff({
-        cwd,
-        adapterConfig: config,
-        runId,
-        ...(sessionPolicyHandoff ?? {}),
-        onLog,
-      });
-    }
     if (paperclipBridge) {
       await paperclipBridge.stop();
     }
@@ -906,6 +897,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         `[paperclip] Restoring workspace changes from ${describeAdapterExecutionTarget(executionTarget)}.\n`,
       );
       await restoreRemoteWorkspace();
+    }
+    if (sessionPolicy === "summarized") {
+      await persistSessionPolicyHandoff({
+        cwd,
+        adapterConfig: config,
+        runId,
+        ...(sessionPolicyHandoff ?? {}),
+        onLog,
+      });
+    }
+    if (effectiveCodexHome !== sharedEffectiveCodexHome) {
+      await fs.rm(effectiveCodexHome, { recursive: true, force: true }).catch(() => undefined);
     }
   }
 }
