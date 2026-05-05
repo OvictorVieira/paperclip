@@ -38,6 +38,10 @@ export function resolveManagedCodexHomeDir(
     : path.resolve(paperclipHome, "instances", instanceId, "codex-home");
 }
 
+function sanitizePathSegment(value: string): string {
+  return value.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "run";
+}
+
 async function ensureParentDir(target: string): Promise<void> {
   await fs.mkdir(path.dirname(target), { recursive: true });
 }
@@ -71,16 +75,7 @@ async function ensureCopiedFile(target: string, source: string): Promise<void> {
   await fs.copyFile(source, target);
 }
 
-export async function prepareManagedCodexHome(
-  env: NodeJS.ProcessEnv,
-  onLog: AdapterExecutionContext["onLog"],
-  companyId?: string,
-): Promise<string> {
-  const targetHome = resolveManagedCodexHomeDir(env, companyId);
-
-  const sourceHome = resolveSharedCodexHomeDir(env);
-  if (path.resolve(sourceHome) === path.resolve(targetHome)) return targetHome;
-
+async function seedCodexHomeFromSource(targetHome: string, sourceHome: string): Promise<void> {
   await fs.mkdir(targetHome, { recursive: true });
 
   for (const name of SYMLINKED_SHARED_FILES) {
@@ -94,10 +89,46 @@ export async function prepareManagedCodexHome(
     if (!(await pathExists(source))) continue;
     await ensureCopiedFile(path.join(targetHome, name), source);
   }
+}
+
+export async function prepareManagedCodexHome(
+  env: NodeJS.ProcessEnv,
+  onLog: AdapterExecutionContext["onLog"],
+  companyId?: string,
+): Promise<string> {
+  const targetHome = resolveManagedCodexHomeDir(env, companyId);
+
+  const sourceHome = resolveSharedCodexHomeDir(env);
+  if (path.resolve(sourceHome) === path.resolve(targetHome)) return targetHome;
+
+  await seedCodexHomeFromSource(targetHome, sourceHome);
 
   await onLog(
     "stdout",
     `[paperclip] Using ${isWorktreeMode(env) ? "worktree-isolated" : "Paperclip-managed"} Codex home "${targetHome}" (seeded from "${sourceHome}").\n`,
+  );
+  return targetHome;
+}
+
+export async function prepareIsolatedCodexHome(input: {
+  env: NodeJS.ProcessEnv;
+  onLog: AdapterExecutionContext["onLog"];
+  companyId?: string;
+  runId: string;
+  sourceHome: string;
+}): Promise<string> {
+  const managedHome = resolveManagedCodexHomeDir(input.env, input.companyId);
+  const targetHome = path.resolve(
+    path.dirname(managedHome),
+    "codex-home-runs",
+    sanitizePathSegment(input.runId),
+  );
+
+  await seedCodexHomeFromSource(targetHome, input.sourceHome);
+
+  await input.onLog(
+    "stdout",
+    `[paperclip] Using isolated Codex home "${targetHome}" for fresh session policy (seeded from "${input.sourceHome}").\n`,
   );
   return targetHome;
 }

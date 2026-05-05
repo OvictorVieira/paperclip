@@ -1047,8 +1047,14 @@ describe("codex execute", () => {
     const workspace = path.join(root, "workspace");
     const commandPath = path.join(root, "codex");
     const capturePath = path.join(root, "capture.json");
+    const paperclipHome = path.join(root, "paperclip-home");
     await fs.mkdir(workspace, { recursive: true });
     await writeFakeCodexCommand(commandPath);
+
+    const previousHome = process.env.HOME;
+    const previousPaperclipHome = process.env.PAPERCLIP_HOME;
+    process.env.HOME = root;
+    process.env.PAPERCLIP_HOME = paperclipHome;
 
     try {
       const result = await execute({
@@ -1080,10 +1086,17 @@ describe("codex execute", () => {
 
       const capture = JSON.parse(await fs.readFile(capturePath, "utf8")) as CapturePayload;
       expect(capture.argv).not.toContain("resume");
+      expect(capture.codexHome).toBe(
+        path.join(paperclipHome, "instances", "default", "companies", "company-1", "codex-home-runs", "run-fresh-policy"),
+      );
       expect(result.sessionId).toBeNull();
       expect(result.sessionParams).toBeNull();
       expect(result.clearSession).toBe(true);
     } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousPaperclipHome === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = previousPaperclipHome;
       await fs.rm(root, { recursive: true, force: true });
     }
   });
@@ -1093,10 +1106,16 @@ describe("codex execute", () => {
     const workspace = path.join(root, "workspace");
     const commandPath = path.join(root, "codex");
     const capturePath = path.join(root, "capture.json");
+    const paperclipHome = path.join(root, "paperclip-home");
     await fs.mkdir(path.join(workspace, ".paperclip-agent"), { recursive: true });
     await fs.writeFile(path.join(workspace, ".paperclip-agent", "NEXT_CONTEXT.md"), "Current goal: cap token growth", "utf8");
     await fs.writeFile(path.join(workspace, ".paperclip-agent", "PROGRESS.md"), "Done: no resume", "utf8");
     await writeFakeCodexCommand(commandPath);
+
+    const previousHome = process.env.HOME;
+    const previousPaperclipHome = process.env.PAPERCLIP_HOME;
+    process.env.HOME = root;
+    process.env.PAPERCLIP_HOME = paperclipHome;
 
     try {
       const result = await execute({
@@ -1128,11 +1147,18 @@ describe("codex execute", () => {
 
       const capture = JSON.parse(await fs.readFile(capturePath, "utf8")) as CapturePayload;
       expect(capture.argv).not.toContain("resume");
+      expect(capture.codexHome).toBe(
+        path.join(paperclipHome, "instances", "default", "companies", "company-1", "codex-home-runs", "run-summarized-policy"),
+      );
       expect(capture.prompt).toContain("fresh disposable session");
       expect(capture.prompt).toContain("Current goal: cap token growth");
       expect(capture.prompt).toContain("Done: no resume");
       expect(result.sessionId).toBeNull();
     } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousPaperclipHome === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = previousPaperclipHome;
       await fs.rm(root, { recursive: true, force: true });
     }
   });
