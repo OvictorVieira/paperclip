@@ -10,6 +10,7 @@ import {
   buildSessionPolicySummaryPrompt,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   materializePaperclipSkillCopy,
+  persistSessionPolicyHandoff,
   renderPaperclipWakePrompt,
   runningProcesses,
   runChildProcess,
@@ -80,6 +81,30 @@ describe("buildSessionPolicySummaryPrompt", () => {
       expect(prompt).toContain("Goal: finish adapter tests");
       expect(prompt).toContain("Done: helper");
       expect(prompt).toContain("Do not include full logs");
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("persistSessionPolicyHandoff", () => {
+  it("creates summarized handoff files from the latest captured summary", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-handoff-"));
+    try {
+      await persistSessionPolicyHandoff({
+        cwd: root,
+        adapterConfig: { sessionPolicy: "summarized", maxSummaryTokens: 2_000 },
+        runId: "run-1",
+        summary: "Done: changed adapter. Next: run tests.",
+        exitCode: 1,
+      });
+
+      const nextContext = await fs.readFile(path.join(root, ".paperclip-agent", "NEXT_CONTEXT.md"), "utf8");
+      const progress = await fs.readFile(path.join(root, ".paperclip-agent", "PROGRESS.md"), "utf8");
+
+      expect(nextContext).toContain("Done: changed adapter. Next: run tests.");
+      expect(nextContext).toContain("exitCode=1");
+      expect(progress).toContain("Run: run-1");
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }

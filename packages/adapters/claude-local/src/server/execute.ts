@@ -46,6 +46,7 @@ import {
   stringifyPaperclipWakePayload,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   buildSessionPolicySummaryPrompt,
+  persistSessionPolicyHandoff,
 } from "@paperclipai/adapter-utils/server-utils";
 import { shellQuote } from "@paperclipai/adapter-utils/ssh";
 import {
@@ -877,9 +878,32 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       clearSession: !persistSessionEnabled || clearSessionForMaxTurns || Boolean(opts.clearSessionOnMissingSession && !resolvedSessionId),
     };
   };
+  let sessionPolicyHandoff: {
+    summary?: string | null;
+    stdout?: string | null;
+    stderr?: string | null;
+    exitCode?: number | null;
+    signal?: string | null;
+    errorMessage?: string | null;
+  } | null = null;
+  const rememberSessionPolicyHandoff = (attempt: {
+    proc: RunProcessResult;
+    parsedStream: ReturnType<typeof parseClaudeStreamJson>;
+    parsed: Record<string, unknown> | null;
+  }) => {
+    sessionPolicyHandoff = {
+      summary: attempt.parsedStream.summary || asString(attempt.parsed?.result, ""),
+      stdout: attempt.proc.stdout,
+      stderr: attempt.proc.stderr,
+      exitCode: attempt.proc.exitCode,
+      signal: attempt.proc.signal,
+      errorMessage: attempt.parsed ? describeClaudeFailure(attempt.parsed) : parseFallbackErrorMessage(attempt.proc),
+    };
+  };
 
   try {
     const initial = await runAttempt(sessionId ?? null);
+    rememberSessionPolicyHandoff(initial);
     if (
       sessionId &&
       !initial.proc.timedOut &&
@@ -892,11 +916,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         `[paperclip] Claude resume session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
       );
       const retry = await runAttempt(null);
+      rememberSessionPolicyHandoff(retry);
       return toAdapterResult(retry, { fallbackSessionId: null, clearSessionOnMissingSession: true });
     }
 
     return toAdapterResult(initial, { fallbackSessionId: persistSessionEnabled ? runtimeSessionId || runtime.sessionId : null });
   } finally {
+    if (sessionPolicy === "summarized") {
+      await persistSessionPolicyHandoff({
+        cwd,
+        adapterConfig: config,
+        runId,
+        ...(sessionPolicyHandoff ?? {}),
+        onLog,
+      });
+    }
     if (paperclipBridge) {
       await paperclipBridge.stop();
     }

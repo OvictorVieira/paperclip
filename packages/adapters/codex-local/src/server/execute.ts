@@ -43,6 +43,7 @@ import {
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   joinPromptSections,
   buildSessionPolicySummaryPrompt,
+  persistSessionPolicyHandoff,
 } from "@paperclipai/adapter-utils/server-utils";
 import {
   parseCodexJsonl,
@@ -818,9 +819,30 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       clearSession: !persistSessionEnabled || Boolean((clearSessionOnMissingSession || forceFreshSession) && !resolvedSessionId),
     };
   };
+  let sessionPolicyHandoff: {
+    summary?: string | null;
+    stdout?: string | null;
+    stderr?: string | null;
+    exitCode?: number | null;
+    signal?: string | null;
+    errorMessage?: string | null;
+  } | null = null;
+  const rememberSessionPolicyHandoff = (
+    attempt: { proc: { exitCode: number | null; signal: string | null; stdout: string; stderr: string }; parsed: ReturnType<typeof parseCodexJsonl> },
+  ) => {
+    sessionPolicyHandoff = {
+      summary: attempt.parsed.summary,
+      stdout: attempt.proc.stdout,
+      stderr: attempt.proc.stderr,
+      exitCode: attempt.proc.exitCode,
+      signal: attempt.proc.signal,
+      errorMessage: attempt.parsed.errorMessage ?? firstNonEmptyLine(attempt.proc.stderr) ?? null,
+    };
+  };
 
   try {
     const initial = await runAttempt(sessionId);
+    rememberSessionPolicyHandoff(initial);
     if (
       sessionId &&
       !initial.proc.timedOut &&
@@ -832,11 +854,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         `[paperclip] Codex resume session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
       );
       const retry = await runAttempt(null);
+      rememberSessionPolicyHandoff(retry);
       return toResult(retry, true, true);
     }
 
     return toResult(initial, false, false);
   } finally {
+    if (sessionPolicy === "summarized") {
+      await persistSessionPolicyHandoff({
+        cwd,
+        adapterConfig: config,
+        runId,
+        ...(sessionPolicyHandoff ?? {}),
+        onLog,
+      });
+    }
     if (paperclipBridge) {
       await paperclipBridge.stop();
     }

@@ -81,6 +81,7 @@ const SENSITIVE_ENV_KEY = /(key|token|secret|password|passwd|authorization|cooki
 const DEFAULT_SESSION_SUMMARY_FILE = ".paperclip-agent/NEXT_CONTEXT.md";
 const DEFAULT_SESSION_PROGRESS_FILE = ".paperclip-agent/PROGRESS.md";
 const DEFAULT_MAX_SUMMARY_CHARS = 8_000;
+const DEFAULT_PROGRESS_HISTORY_CHARS = 24_000;
 const REDACTED_LOG_VALUE = "***REDACTED***";
 const PAPERCLIP_SKILL_ROOT_RELATIVE_CANDIDATES = [
   "../../skills",
@@ -223,6 +224,99 @@ function truncateSummaryText(text: string, maxSummaryTokens: number): string {
   const maxChars = maxSummaryTokens > 0 ? Math.max(1_000, maxSummaryTokens * 4) : DEFAULT_MAX_SUMMARY_CHARS;
   if (text.length <= maxChars) return text;
   return text.slice(text.length - maxChars);
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function firstUsefulExcerpt(...values: Array<string | null | undefined>): string {
+  for (const value of values) {
+    const trimmed = typeof value === "string" ? value.trim() : "";
+    if (trimmed.length > 0) return trimmed;
+  }
+  return "";
+}
+
+export async function persistSessionPolicyHandoff(input: {
+  cwd: string;
+  adapterConfig: unknown;
+  runId?: string | null;
+  summary?: string | null;
+  stdout?: string | null;
+  stderr?: string | null;
+  exitCode?: number | null;
+  signal?: string | null;
+  errorMessage?: string | null;
+  onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+}): Promise<void> {
+  const config = parseObject(input.adapterConfig);
+  const summaryFile = asString(config.summaryFile, DEFAULT_SESSION_SUMMARY_FILE);
+  const progressFile = asString(config.progressFile, DEFAULT_SESSION_PROGRESS_FILE);
+  const maxSummaryTokens = asNumber(config.maxSummaryTokens, 2_000);
+  const summaryPath = resolveWorkspaceRelativePath(input.cwd, summaryFile, DEFAULT_SESSION_SUMMARY_FILE);
+  const progressPath = resolveWorkspaceRelativePath(input.cwd, progressFile, DEFAULT_SESSION_PROGRESS_FILE);
+  const maxChars = maxSummaryTokens > 0 ? Math.max(1_000, maxSummaryTokens * 4) : DEFAULT_MAX_SUMMARY_CHARS;
+  const excerpt = truncateSummaryText(
+    firstUsefulExcerpt(input.summary, input.stderr, input.stdout, input.errorMessage),
+    maxSummaryTokens,
+  );
+  const runLabel = input.runId ? `Run: ${input.runId}` : "Run: unknown";
+  const statusParts = [
+    input.exitCode === undefined ? "" : `exitCode=${input.exitCode ?? "null"}`,
+    input.signal ? `signal=${input.signal}` : "",
+    input.errorMessage ? `error=${input.errorMessage}` : "",
+  ].filter(Boolean);
+  const status = statusParts.length > 0 ? statusParts.join(" ") : "status=unknown";
+  const summaryBody = excerpt || "No model summary captured before interruption. Inspect git status and workspace files.";
+  const nextContext = [
+    "# Next Context",
+    "",
+    `Updated: ${nowIso()}`,
+    runLabel,
+    `Status: ${status}`,
+    "",
+    "Current goal:",
+    "- Continue current Paperclip issue from workspace state.",
+    "",
+    "Completed work:",
+    summaryBody,
+    "",
+    "Files changed:",
+    "- Inspect `git status`.",
+    "",
+    "Known blockers:",
+    input.errorMessage ? `- ${input.errorMessage}` : "- None recorded.",
+    "",
+    "Next action:",
+    `- Read \`${progressFile}\`, inspect \`git status\`, continue next unfinished unit.`,
+  ].join("\n");
+  const progressEntry = [
+    `## ${nowIso()}`,
+    runLabel,
+    `Status: ${status}`,
+    "",
+    summaryBody,
+    "",
+  ].join("\n");
+
+  try {
+    await fs.mkdir(path.dirname(summaryPath), { recursive: true });
+    await fs.mkdir(path.dirname(progressPath), { recursive: true });
+    await fs.writeFile(summaryPath, nextContext.slice(0, maxChars), "utf8");
+    const previousProgress = await fs.readFile(progressPath, "utf8").catch(() => "");
+    const nextProgress = `${previousProgress.trim() ? `${previousProgress.trim()}\n\n` : ""}${progressEntry}`;
+    await fs.writeFile(
+      progressPath,
+      nextProgress.length > DEFAULT_PROGRESS_HISTORY_CHARS
+        ? nextProgress.slice(nextProgress.length - DEFAULT_PROGRESS_HISTORY_CHARS)
+        : nextProgress,
+      "utf8",
+    );
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    await input.onLog?.("stderr", `[paperclip] Failed to persist session handoff: ${reason}\n`);
+  }
 }
 
 export async function buildSessionPolicySummaryPrompt(input: {
