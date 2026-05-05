@@ -91,22 +91,61 @@ async function seedCodexHomeFromSource(targetHome: string, sourceHome: string): 
   }
 }
 
+/**
+ * Writes an `auth.json` containing only `OPENAI_API_KEY` so the codex CLI can
+ * authenticate via API key. Overwrites any existing file or symlink at that
+ * path. Required because the codex CLI (>= 0.122) ignores the `OPENAI_API_KEY`
+ * environment variable and only reads credentials from `$CODEX_HOME/auth.json`.
+ */
+export async function writeApiKeyAuthJson(home: string, apiKey: string): Promise<void> {
+  await fs.mkdir(home, { recursive: true });
+  const target = path.join(home, "auth.json");
+  await fs.rm(target, { force: true });
+  await fs.writeFile(target, JSON.stringify({ OPENAI_API_KEY: apiKey }), { mode: 0o600 });
+}
+
 export async function prepareManagedCodexHome(
   env: NodeJS.ProcessEnv,
   onLog: AdapterExecutionContext["onLog"],
   companyId?: string,
+  options: { apiKey?: string | null } = {},
 ): Promise<string> {
   const targetHome = resolveManagedCodexHomeDir(env, companyId);
+  const apiKey = nonEmpty(options.apiKey ?? undefined);
 
   const sourceHome = resolveSharedCodexHomeDir(env);
-  if (path.resolve(sourceHome) === path.resolve(targetHome)) return targetHome;
+  const seedFromShared = path.resolve(sourceHome) !== path.resolve(targetHome);
 
-  await seedCodexHomeFromSource(targetHome, sourceHome);
+  await fs.mkdir(targetHome, { recursive: true });
 
-  await onLog(
-    "stdout",
-    `[paperclip] Using ${isWorktreeMode(env) ? "worktree-isolated" : "Paperclip-managed"} Codex home "${targetHome}" (seeded from "${sourceHome}").\n`,
-  );
+  // If a previous run wrote an apikey-mode auth.json (regular file) and this
+  // run has no apiKey, remove it so the chatgpt-mode symlink can be restored.
+  // Without this cleanup, ensureSymlink bails on a non-symlink and Codex keeps
+  // authenticating with the stale key after it is removed from configuration.
+  if (!apiKey && seedFromShared) {
+    const authPath = path.join(targetHome, "auth.json");
+    const existing = await fs.lstat(authPath).catch(() => null);
+    if (existing && !existing.isSymbolicLink()) {
+      await fs.rm(authPath, { force: true });
+    }
+  }
+
+  if (seedFromShared) {
+    await seedCodexHomeFromSource(targetHome, sourceHome);
+    await onLog(
+      "stdout",
+      `[paperclip] Using ${isWorktreeMode(env) ? "worktree-isolated" : "Paperclip-managed"} Codex home "${targetHome}" (seeded from "${sourceHome}").\n`,
+    );
+  }
+
+  if (apiKey) {
+    await writeApiKeyAuthJson(targetHome, apiKey);
+    await onLog(
+      "stdout",
+      `[paperclip] Wrote API-key auth.json into Codex home "${targetHome}" from configured OPENAI_API_KEY.\n`,
+    );
+  }
+
   return targetHome;
 }
 
