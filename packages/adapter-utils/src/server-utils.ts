@@ -81,7 +81,8 @@ const TERMINAL_RESULT_SCAN_OVERLAP_CHARS = 64 * 1024;
 const SENSITIVE_ENV_KEY = /(key|token|secret|password|passwd|authorization|cookie)/i;
 const DEFAULT_SESSION_SUMMARY_FILE = ".paperclip-agent/NEXT_CONTEXT.md";
 const DEFAULT_SESSION_PROGRESS_FILE = ".paperclip-agent/PROGRESS.md";
-const DEFAULT_MAX_SUMMARY_CHARS = 8_000;
+const DEFAULT_MAX_SUMMARY_CHARS = 4_000;
+const DEFAULT_MAX_PROGRESS_CHARS = 8_000;
 const DEFAULT_PROGRESS_HISTORY_CHARS = 24_000;
 const REDACTED_LOG_VALUE = "***REDACTED***";
 const PAPERCLIP_SKILL_ROOT_RELATIVE_CANDIDATES = [
@@ -251,6 +252,45 @@ function firstUsefulExcerpt(...values: Array<string | null | undefined>): string
   return "";
 }
 
+// ---------------------------------------------------------------------------
+// Handoff sanitisation & truncation helpers for the "summarized" session policy
+// ---------------------------------------------------------------------------
+
+const HANDOFF_NOISE_PATTERNS: Array<[RegExp, string]> = [
+  [/You've hit your usage limit[\s\S]*?(?=\n\n|$)/gi, "[omitted: repeated provider limit]"],
+  [/Your access token could not be refreshed[\s\S]*?(?=\n\n|$)/gi, "[omitted: repeated auth error]"],
+  [/refresh_token_reused[\s\S]*?(?=\n\n|$)/gi, "[omitted: repeated token error]"],
+  [/failed to connect to websocket[\s\S]*?(?=\n\n|$)/gi, "[omitted: repeated connection error]"],
+  [/\{"type"\s*:\s*"thread\.started"[\s\S]*?\}/gi, "[omitted: raw CLI event]"],
+  [/\{"type"\s*:\s*"turn\.failed"[\s\S]*?\}/gi, "[omitted: raw CLI event]"],
+  [/\{"type"\s*:\s*"turn\.started"[\s\S]*?\}/gi, "[omitted: raw CLI event]"],
+  [/\{"type"\s*:\s*"turn\.completed"[\s\S]*?\}/gi, "[omitted: raw CLI event]"],
+  [/\{"type"\s*:\s*"message\.start"[\s\S]*?\}/gi, "[omitted: raw CLI event]"],
+];
+
+export function sanitizeHandoffContent(content: string): string {
+  if (!content) return "";
+  let output = content;
+  for (const [pattern, replacement] of HANDOFF_NOISE_PATTERNS) {
+    output = output.replace(pattern, replacement);
+  }
+  // Collapse runs of 3+ blank lines into two.
+  output = output.replace(/\n{4,}/g, "\n\n\n");
+  return output;
+}
+
+export function truncateForPrompt(content: string, maxChars: number): string {
+  if (!content) return "";
+  if (content.length <= maxChars) return content;
+  const headSize = Math.floor(maxChars * 0.35);
+  const tailSize = Math.floor(maxChars * 0.65);
+  return [
+    content.slice(0, headSize),
+    "\n\n...[truncated by Paperclip context budget]...\n\n",
+    content.slice(-tailSize),
+  ].join("");
+}
+
 export async function persistSessionPolicyHandoff(input: {
   cwd: string;
   adapterConfig: unknown;
@@ -266,14 +306,18 @@ export async function persistSessionPolicyHandoff(input: {
   const config = parseObject(input.adapterConfig);
   const summaryFile = asString(config.summaryFile, DEFAULT_SESSION_SUMMARY_FILE);
   const progressFile = asString(config.progressFile, DEFAULT_SESSION_PROGRESS_FILE);
-  const maxSummaryTokens = asNumber(config.maxSummaryTokens, 2_000);
+  const doSanitize = asBoolean(config.sanitizeHandoff, true);
+  const maxSummaryChars = asNumber(
+    config.maxSummaryChars,
+    asNumber(config.maxSummaryTokens, 0) > 0
+      ? Math.max(1_000, asNumber(config.maxSummaryTokens, 0) * 4)
+      : DEFAULT_MAX_SUMMARY_CHARS,
+  );
   const summaryPath = resolveWorkspaceRelativePath(input.cwd, summaryFile, DEFAULT_SESSION_SUMMARY_FILE);
   const progressPath = resolveWorkspaceRelativePath(input.cwd, progressFile, DEFAULT_SESSION_PROGRESS_FILE);
-  const maxChars = maxSummaryTokens > 0 ? Math.max(1_000, maxSummaryTokens * 4) : DEFAULT_MAX_SUMMARY_CHARS;
-  const excerpt = truncateSummaryText(
-    firstUsefulExcerpt(input.summary, input.stderr, input.stdout, input.errorMessage),
-    maxSummaryTokens,
-  );
+  const rawExcerpt = firstUsefulExcerpt(input.summary, input.stderr, input.stdout, input.errorMessage);
+  const sanitizedExcerpt = doSanitize ? sanitizeHandoffContent(rawExcerpt) : rawExcerpt;
+  const excerpt = truncateForPrompt(sanitizedExcerpt, maxSummaryChars);
   const runLabel = input.runId ? `Run: ${input.runId}` : "Run: unknown";
   const statusParts = [
     input.exitCode === undefined ? "" : `exitCode=${input.exitCode ?? "null"}`,
@@ -311,19 +355,20 @@ export async function persistSessionPolicyHandoff(input: {
     `- Read \`${progressFile}\`, inspect \`git status\`, continue next unfinished unit.`,
   ].join("\n");
 
-  const allowedBodyChars = maxChars - headerAndGoal.length - filesChangedAndFooter.length - 2;
+  const allowedBodyChars = maxSummaryChars - headerAndGoal.length - filesChangedAndFooter.length - 2;
   const truncatedBody =
     summaryBody.length > allowedBodyChars
       ? summaryBody.slice(0, Math.max(0, allowedBodyChars))
       : summaryBody;
 
   const nextContext = [headerAndGoal, truncatedBody, filesChangedAndFooter].join("\n");
+  const progressBody = truncateForPrompt(summaryBody, DEFAULT_MAX_PROGRESS_CHARS);
   const progressEntry = [
     `## ${nowIso()}`,
     runLabel,
     `Status: ${status}`,
     "",
-    summaryBody,
+    progressBody,
     "",
   ].join("\n");
 
@@ -351,56 +396,97 @@ export async function persistSessionPolicyHandoff(input: {
   }
 }
 
+export interface SessionPolicySummaryMetrics {
+  rawSummaryChars: number;
+  injectedSummaryChars: number;
+  rawProgressChars: number;
+  injectedProgressChars: number;
+  injectProgressFile: boolean;
+  sanitizeHandoff: boolean;
+  totalPromptChars: number;
+}
+
 export async function buildSessionPolicySummaryPrompt(input: {
   cwd: string;
   adapterConfig: unknown;
-}): Promise<string> {
+}): Promise<{ prompt: string; metrics: SessionPolicySummaryMetrics }> {
   const config = parseObject(input.adapterConfig);
   const summaryFile = asString(config.summaryFile, DEFAULT_SESSION_SUMMARY_FILE);
   const progressFile = asString(config.progressFile, DEFAULT_SESSION_PROGRESS_FILE);
-  const maxSummaryTokens = asNumber(config.maxSummaryTokens, 2_000);
+  const injectProgressFile = asBoolean(config.injectProgressFile, false);
+  const doSanitize = asBoolean(config.sanitizeHandoff, true);
+
+  // Support both maxSummaryChars (preferred) and legacy maxSummaryTokens.
+  const maxSummaryChars = asNumber(
+    config.maxSummaryChars,
+    asNumber(config.maxSummaryTokens, 0) > 0
+      ? Math.max(1_000, asNumber(config.maxSummaryTokens, 0) * 4)
+      : DEFAULT_MAX_SUMMARY_CHARS,
+  );
+  const maxProgressChars = asNumber(config.maxProgressChars, DEFAULT_MAX_PROGRESS_CHARS);
+
   const summaryPath = resolveWorkspaceRelativePath(input.cwd, summaryFile, DEFAULT_SESSION_SUMMARY_FILE);
   const progressPath = resolveWorkspaceRelativePath(input.cwd, progressFile, DEFAULT_SESSION_PROGRESS_FILE);
-  const [summary, progress] = await Promise.all([
-    fs.readFile(summaryPath, "utf8").catch(() => ""),
-    fs.readFile(progressPath, "utf8").catch(() => ""),
-  ]);
-  const summaryText = truncateSummaryText(summary.trim(), maxSummaryTokens);
-  const progressText = truncateSummaryText(progress.trim(), maxSummaryTokens);
 
-  return [
+  const rawSummary = await fs.readFile(summaryPath, "utf8").catch(() => "");
+  const rawProgress = injectProgressFile
+    ? await fs.readFile(progressPath, "utf8").catch(() => "")
+    : "";
+
+  const cleanSummary = doSanitize ? sanitizeHandoffContent(rawSummary.trim()) : rawSummary.trim();
+  const cleanProgress = doSanitize ? sanitizeHandoffContent(rawProgress.trim()) : rawProgress.trim();
+
+  const summaryText = truncateForPrompt(cleanSummary, maxSummaryChars);
+  const progressText = injectProgressFile ? truncateForPrompt(cleanProgress, maxProgressChars) : "";
+
+  const sections: string[] = [
     "# Session Policy",
     "",
     "You are running in a fresh disposable session.",
     "",
     "Do not rely on previous chat/session memory.",
     "",
-    "At the start:",
-    `1. Read \`${summaryFile}\` if it exists.`,
-    `2. Read \`${progressFile}\` if it exists.`,
-    "3. Inspect `git status`.",
-    "4. Continue only the next unfinished unit of work.",
+    "Use only:",
+    "- the current Paperclip issue;",
+    "- the current workspace state;",
+    "- the concise handoff below.",
     "",
-    "Previous handoff summary:",
+    `Do not read full \`${progressFile}\`.`,
+    "Do not paste raw logs into handoff files.",
+    "Do not paste full diffs or full command outputs.",
+    "Do not run nested agent orchestrators.",
+    "",
+    "## Previous Handoff",
     "",
     summaryText || "(empty)",
-    "",
-    "Previous progress:",
-    "",
-    progressText || "(empty)",
+  ];
+
+  if (injectProgressFile && progressText) {
+    sections.push("", "## Progress Snapshot", "", progressText);
+  }
+
+  sections.push(
     "",
     "At the end of the run:",
-    `1. Update \`${progressFile}\`.`,
-    `2. Update \`${summaryFile}\`.`,
-    `3. Keep \`${summaryFile}\` concise.`,
-    "4. Include only:",
-    "   - current goal;",
-    "   - completed work;",
-    "   - files changed;",
-    "   - known blockers;",
-    "   - next action.",
-    "5. Do not include full logs, full diffs, dependency dumps or repeated instructions.",
-  ].join("\n");
+    `1. Update \`${summaryFile}\` with a concise handoff (goal, completed, blockers, next action).`,
+    `2. Keep \`${summaryFile}\` under ${maxSummaryChars} characters.`,
+    "3. Do not include full logs, full diffs, dependency dumps, or repeated instructions.",
+  );
+
+  const prompt = sections.join("\n");
+
+  return {
+    prompt,
+    metrics: {
+      rawSummaryChars: rawSummary.length,
+      injectedSummaryChars: summaryText.length,
+      rawProgressChars: rawProgress.length,
+      injectedProgressChars: progressText.length,
+      injectProgressFile,
+      sanitizeHandoff: doSanitize,
+      totalPromptChars: prompt.length,
+    },
+  };
 }
 
 export function parseJson(value: string): Record<string, unknown> | null {
