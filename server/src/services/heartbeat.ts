@@ -3592,12 +3592,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
     }
 
-    if (!allowFallbackWorkspace) {
+    // Block fallback only when a configured workspace source existed but was invalid.
+    // When no project and no prior session exist, there is nothing to "silently override" —
+    // allow the fallback unconditionally (same rationale as workspace-resolution.ts).
+    const hadConfiguredSource = Boolean(sessionCwd) || Boolean(resolvedProjectId);
+    if (!allowFallbackWorkspace && hadConfiguredSource) {
       const detail = sessionCwd
         ? `Saved session workspace "${sessionCwd}" is not available.`
-        : resolvedProjectId
-          ? "No project workspace directory is currently available for this issue."
-          : "No project or prior session workspace was available.";
+        : "No project workspace directory is currently available for this issue.";
       throw new Error(
         `${detail}\nRefusing to use fallback workspace because allowFallbackWorkspace=false. Configure a valid project workspace path inside the container.`,
       );
