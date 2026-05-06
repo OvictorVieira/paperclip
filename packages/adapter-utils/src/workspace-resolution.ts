@@ -81,8 +81,12 @@ export function resolveExecutionWorkspace(
   input: ResolveExecutionWorkspaceInput,
   pathExistsFn: (p: string) => boolean = pathExists,
 ): ResolveExecutionWorkspaceResult {
+  // allowFallbackWorkspace=false only blocks fallback when a configured workspace
+  // was provided but invalid. When no workspace is configured at all, the fallback
+  // is permitted unconditionally (there is nothing to "silently override").
   const allowFallback = input.allowFallbackWorkspace ?? false;
   const abortOnInvalid = input.abortOnInvalidWorkspace ?? true;
+  const hadConfiguredWorkspace = Boolean(input.configuredWorkspace);
 
   // --- 1. Configured workspace -----------------------------------------
   if (input.configuredWorkspace) {
@@ -126,8 +130,13 @@ export function resolveExecutionWorkspace(
     };
   }
 
-  // --- 3. Fallback workspace (opt-in) -----------------------------------
-  if (allowFallback && input.fallbackWorkspace && pathExistsFn(input.fallbackWorkspace)) {
+  // --- 3. Fallback workspace -------------------------------------------
+  // Blocked by allowFallbackWorkspace=false only when a configured workspace
+  // was explicitly provided (and was invalid). When no workspace was configured
+  // at all, we allow the fallback unconditionally — there is no misconfiguration
+  // to protect against.
+  const fallbackAllowed = allowFallback || !hadConfiguredWorkspace;
+  if (fallbackAllowed && input.fallbackWorkspace && pathExistsFn(input.fallbackWorkspace)) {
     return {
       workspacePath: input.fallbackWorkspace,
       source: "fallback",
@@ -138,7 +147,7 @@ export function resolveExecutionWorkspace(
   throw new Error(
     [
       "No valid execution workspace was resolved.",
-      allowFallback
+      allowFallback || !hadConfiguredWorkspace
         ? "Fallback workspace path does not exist."
         : "Refusing to use fallback workspace because allowFallbackWorkspace=false.",
       "Configure a valid project workspace path inside the container.",
