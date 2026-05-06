@@ -685,10 +685,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   })();
   const renderedPrompt = shouldUseResumeDeltaPrompt ? "" : renderTemplate(promptTemplate, templateData);
   const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
-  const sessionPolicySummaryPrompt =
+  const sessionPolicySummaryResult =
     sessionPolicy === "summarized"
       ? await buildSessionPolicySummaryPrompt({ cwd, adapterConfig: config })
-      : "";
+      : null;
+  const sessionPolicySummaryPrompt = sessionPolicySummaryResult?.prompt ?? "";
   const prompt = joinPromptSections([
     promptInstructionsPrefix,
     renderedBootstrapPrompt,
@@ -706,6 +707,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     sessionHandoffChars: sessionHandoffNote.length,
     sessionPolicySummaryChars: sessionPolicySummaryPrompt.length,
     heartbeatPromptChars: renderedPrompt.length,
+    ...(sessionPolicySummaryResult?.metrics ? {
+      spRawSummaryChars: sessionPolicySummaryResult.metrics.rawSummaryChars,
+      spInjectedSummaryChars: sessionPolicySummaryResult.metrics.injectedSummaryChars,
+      spRawProgressChars: sessionPolicySummaryResult.metrics.rawProgressChars,
+      spInjectedProgressChars: sessionPolicySummaryResult.metrics.injectedProgressChars,
+      spTotalPromptChars: sessionPolicySummaryResult.metrics.totalPromptChars,
+    } : {}),
   };
 
   const runAttempt = async (resumeSessionId: string | null) => {

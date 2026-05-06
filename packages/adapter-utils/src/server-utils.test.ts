@@ -14,9 +14,11 @@ import {
   renderPaperclipWakePrompt,
   runningProcesses,
   runChildProcess,
+  sanitizeHandoffContent,
   sanitizeSshRemoteEnv,
   shapePaperclipWorkspaceEnvForExecution,
   stringifyPaperclipWakePayload,
+  truncateForPrompt,
 } from "./server-utils.js";
 
 function isPidAlive(pid: number) {
@@ -65,22 +67,94 @@ describe("buildInvocationEnvForLogs", () => {
 });
 
 describe("buildSessionPolicySummaryPrompt", () => {
-  it("injects concise workspace handoff files", async () => {
+  it("injects concise workspace handoff — summary only by default", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-session-policy-"));
     try {
       await fs.mkdir(path.join(root, ".paperclip-agent"), { recursive: true });
       await fs.writeFile(path.join(root, ".paperclip-agent", "NEXT_CONTEXT.md"), "Goal: finish adapter tests", "utf8");
-      await fs.writeFile(path.join(root, ".paperclip-agent", "PROGRESS.md"), "Done: helper", "utf8");
+      await fs.writeFile(path.join(root, ".paperclip-agent", "PROGRESS.md"), "Done: helper PROGRESS_BIG_CONTENT", "utf8");
 
-      const prompt = await buildSessionPolicySummaryPrompt({
+      const { prompt, metrics } = await buildSessionPolicySummaryPrompt({
         cwd: root,
         adapterConfig: { sessionPolicy: "summarized", maxSummaryTokens: 2_000 },
       });
 
       expect(prompt).toContain("fresh disposable session");
       expect(prompt).toContain("Goal: finish adapter tests");
+      // PROGRESS.md should NOT be injected by default (injectProgressFile defaults to false)
+      expect(prompt).not.toContain("PROGRESS_BIG_CONTENT");
+      expect(prompt).toContain("Do not paste raw logs");
+      expect(metrics.injectProgressFile).toBe(false);
+      expect(metrics.injectedProgressChars).toBe(0);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("injects progress when injectProgressFile is true", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-session-policy-"));
+    try {
+      await fs.mkdir(path.join(root, ".paperclip-agent"), { recursive: true });
+      await fs.writeFile(path.join(root, ".paperclip-agent", "NEXT_CONTEXT.md"), "Goal: tests", "utf8");
+      await fs.writeFile(path.join(root, ".paperclip-agent", "PROGRESS.md"), "Done: helper", "utf8");
+
+      const { prompt, metrics } = await buildSessionPolicySummaryPrompt({
+        cwd: root,
+        adapterConfig: { sessionPolicy: "summarized", injectProgressFile: true },
+      });
+
       expect(prompt).toContain("Done: helper");
-      expect(prompt).toContain("Do not include full logs");
+      expect(prompt).toContain("Progress Snapshot");
+      expect(metrics.injectProgressFile).toBe(true);
+      expect(metrics.injectedProgressChars).toBeGreaterThan(0);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("truncates large summary files within budget", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-session-policy-"));
+    try {
+      await fs.mkdir(path.join(root, ".paperclip-agent"), { recursive: true });
+      const bigContent = "X".repeat(100_000);
+      await fs.writeFile(path.join(root, ".paperclip-agent", "NEXT_CONTEXT.md"), bigContent, "utf8");
+
+      const { prompt, metrics } = await buildSessionPolicySummaryPrompt({
+        cwd: root,
+        adapterConfig: { sessionPolicy: "summarized", maxSummaryChars: 4_000 },
+      });
+
+      expect(metrics.rawSummaryChars).toBe(100_000);
+      expect(metrics.injectedSummaryChars).toBeLessThanOrEqual(4_200);
+      expect(prompt).toContain("truncated by Paperclip context budget");
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("sanitizes known noise patterns from handoff content", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-session-policy-"));
+    try {
+      await fs.mkdir(path.join(root, ".paperclip-agent"), { recursive: true });
+      const noisy = [
+        "Goal: fix auth",
+        'You\'ve hit your usage limit for the day.',
+        'refresh_token_reused: please re-auth',
+        '{"type":"thread.started","id":"t1"}',
+        '{"type":"turn.failed","error":"timeout"}',
+      ].join("\n\n");
+      await fs.writeFile(path.join(root, ".paperclip-agent", "NEXT_CONTEXT.md"), noisy, "utf8");
+
+      const { prompt } = await buildSessionPolicySummaryPrompt({
+        cwd: root,
+        adapterConfig: { sessionPolicy: "summarized" },
+      });
+
+      expect(prompt).toContain("Goal: fix auth");
+      expect(prompt).not.toContain("refresh_token_reused");
+      expect(prompt).not.toContain('"type":"thread.started"');
+      expect(prompt).not.toContain('"type":"turn.failed"');
+      expect(prompt).toContain("[omitted:");
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }
@@ -119,6 +193,54 @@ describe("buildSessionPolicySummaryPrompt", () => {
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe("truncateForPrompt", () => {
+  it("returns content unchanged when within budget", () => {
+    expect(truncateForPrompt("short", 1000)).toBe("short");
+  });
+
+  it("truncates with head/tail split and marker", () => {
+    const big = "A".repeat(200);
+    const result = truncateForPrompt(big, 100);
+    expect(result.length).toBeLessThanOrEqual(200);
+    expect(result).toContain("truncated by Paperclip context budget");
+    expect(result.startsWith("A")).toBe(true);
+    expect(result.endsWith("A")).toBe(true);
+  });
+
+  it("returns empty for empty input", () => {
+    expect(truncateForPrompt("", 100)).toBe("");
+  });
+});
+
+describe("sanitizeHandoffContent", () => {
+  it("strips known noise patterns", () => {
+    const noisy = [
+      "Good content here.",
+      "You've hit your usage limit for today.",
+      "refresh_token_reused: re-auth needed",
+      '{"type":"thread.started","id":"123"}',
+      '{"type":"turn.failed","error":"x"}',
+      "More good content.",
+    ].join("\n\n");
+
+    const result = sanitizeHandoffContent(noisy);
+    expect(result).toContain("Good content here.");
+    expect(result).toContain("More good content.");
+    expect(result).not.toContain("refresh_token_reused");
+    expect(result).not.toContain('"type":"thread.started"');
+    expect(result).not.toContain('"type":"turn.failed"');
+  });
+
+  it("collapses excessive blank lines", () => {
+    const gappy = "a\n\n\n\n\n\nb";
+    expect(sanitizeHandoffContent(gappy)).toBe("a\n\n\nb");
+  });
+
+  it("returns empty for empty input", () => {
+    expect(sanitizeHandoffContent("")).toBe("");
   });
 });
 

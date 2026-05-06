@@ -1158,7 +1158,8 @@ describe("codex execute", () => {
       );
       expect(capture.prompt).toContain("fresh disposable session");
       expect(capture.prompt).toContain("Current goal: cap token growth");
-      expect(capture.prompt).toContain("Done: no resume");
+      // PROGRESS.md is NOT injected by default (injectProgressFile defaults to false)
+      expect(capture.prompt).not.toContain("Done: no resume");
       expect(result.sessionId).toBeNull();
     } finally {
       if (previousHome === undefined) delete process.env.HOME;
