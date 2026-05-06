@@ -161,6 +161,11 @@ import {
   readPaperclipSkillSyncPreference,
   writePaperclipSkillSyncPreference,
 } from "@paperclipai/adapter-utils/server-utils";
+import {
+  looksLikeHostPath,
+  mapWorkspacePath,
+  readWorkspaceResolutionConfig,
+} from "@paperclipai/adapter-utils/workspace-resolution";
 import { extractSkillMentionIds } from "@paperclipai/shared";
 import { environmentService } from "./environments.js";
 import { environmentRuntimeService } from "./environment-runtime.js";
@@ -3386,7 +3391,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     agent: typeof agents.$inferSelect,
     context: Record<string, unknown>,
     previousSessionParams: Record<string, unknown> | null,
-    opts?: { useProjectWorkspace?: boolean | null },
+    opts?: {
+      useProjectWorkspace?: boolean | null;
+      allowFallbackWorkspace?: boolean;
+      abortOnInvalidWorkspace?: boolean;
+      workspacePathMap?: Record<string, string> | null;
+    },
   ): Promise<ResolvedWorkspaceForRun> {
     const issueId = readNonEmptyString(context.issueId);
     const contextProjectId = readNonEmptyString(context.projectId);
@@ -3407,6 +3417,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const resolvedProjectId = issueProjectId ?? contextProjectId;
     const useProjectWorkspace = opts?.useProjectWorkspace !== false;
     const workspaceProjectId = useProjectWorkspace ? resolvedProjectId : null;
+    const allowFallbackWorkspace = opts?.allowFallbackWorkspace ?? false;
+    const abortOnInvalidWorkspace = opts?.abortOnInvalidWorkspace ?? true;
+    const workspacePathMap = opts?.workspacePathMap ?? null;
 
     const unorderedProjectWorkspaceRows = workspaceProjectId
       ? await db
@@ -3463,13 +3476,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         }
         hasConfiguredProjectCwd = true;
+        const mappedProjectCwd = mapWorkspacePath(projectCwd, workspacePathMap);
         const projectCwdExists = await fs
-          .stat(projectCwd)
+          .stat(mappedProjectCwd)
           .then((stats) => stats.isDirectory())
           .catch(() => false);
         if (projectCwdExists) {
           return {
-            cwd: projectCwd,
+            cwd: mappedProjectCwd,
             source: "project_primary" as const,
             projectId: resolvedProjectId,
             workspaceId: workspace.id,
@@ -3488,7 +3502,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         missingProjectCwds.push(projectCwd);
       }
 
+      // --- Fail-fast: abort when configured workspaces are missing and fallback is disallowed ---
+      if (missingProjectCwds.length > 0 && abortOnInvalidWorkspace && !allowFallbackWorkspace) {
+        const firstMissing = missingProjectCwds[0]!;
+        const hostHint = looksLikeHostPath(firstMissing)
+          ? " The configured path looks like a host/macOS path. Agents run inside the Paperclip container. Use /workspace/<repo> or configure workspacePathMap in adapterConfig."
+          : "";
+        throw new Error(
+          `Configured project workspace path does not exist inside the Paperclip runtime container.\n\nConfigured path: ${firstMissing}${hostHint}`,
+        );
+      }
+
       const fallbackCwd = resolveDefaultAgentWorkspaceDir(agent.id);
+      if (!allowFallbackWorkspace) {
+        throw new Error(
+          [
+            "No valid project workspace was resolved and fallback workspace is disabled.",
+            "Set allowFallbackWorkspace=true in adapterConfig to allow fallback,",
+            "or configure a valid project workspace path inside the container.",
+            ...(missingProjectCwds.length > 0 ? [`\nConfigured paths tried: ${missingProjectCwds.join(", ")}`] : []),
+          ].join("\n"),
+        );
+      }
       await fs.mkdir(fallbackCwd, { recursive: true });
       const warnings: string[] = [];
       if (preferredWorkspaceWarning) {
@@ -3555,6 +3590,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           warnings: [],
         };
       }
+    }
+
+    if (!allowFallbackWorkspace) {
+      const detail = sessionCwd
+        ? `Saved session workspace "${sessionCwd}" is not available.`
+        : resolvedProjectId
+          ? "No project workspace directory is currently available for this issue."
+          : "No project or prior session workspace was available.";
+      throw new Error(
+        `${detail}\nRefusing to use fallback workspace because allowFallbackWorkspace=false. Configure a valid project workspace path inside the container.`,
+      );
     }
 
     const cwd = resolveDefaultAgentWorkspaceDir(agent.id);
@@ -6612,6 +6658,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       (explicitResumeSessionDisplayId ? { sessionId: explicitResumeSessionDisplayId } : null) ??
       normalizeSessionParams(sessionCodec.deserialize(taskSessionForRun?.sessionParamsJson ?? null));
     const config = parseObject(agent.adapterConfig);
+    const workspaceResolutionConfig = readWorkspaceResolutionConfig(agent.adapterConfig);
     const requestedExecutionWorkspaceMode = resolveExecutionWorkspaceMode({
       projectPolicy: projectExecutionWorkspacePolicy,
       issueSettings: issueExecutionWorkspaceSettings,
@@ -6621,7 +6668,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       agent,
       context,
       previousSessionParams,
-      { useProjectWorkspace: requestedExecutionWorkspaceMode !== "agent_default" },
+      {
+        useProjectWorkspace: requestedExecutionWorkspaceMode !== "agent_default",
+        ...workspaceResolutionConfig,
+      },
     );
     const issueRef = issueContext
       ? {
