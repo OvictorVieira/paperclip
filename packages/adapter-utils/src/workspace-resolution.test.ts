@@ -193,6 +193,23 @@ describe("resolveExecutionWorkspace", () => {
     });
   });
 
+  it("allows fallback when no workspace configured even if allowFallbackWorkspace=false", () => {
+    expect(
+      resolveExecutionWorkspace(
+        {
+          configuredWorkspace: null,
+          priorSessionWorkspace: null,
+          fallbackWorkspace: "/paperclip/instances/default/workspaces/abc",
+          allowFallbackWorkspace: false,
+        },
+        mockExists,
+      ),
+    ).toMatchObject({
+      source: "fallback",
+      usedFallback: true,
+    });
+  });
+
   it("throws when no workspace can be resolved at all", () => {
     expect(() =>
       resolveExecutionWorkspace(
