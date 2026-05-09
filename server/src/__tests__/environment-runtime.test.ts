@@ -116,7 +116,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     stopDb = started.stop;
     db = createDb(started.connectionString);
     runtime = environmentRuntimeService(db);
-  });
+  }, 30_000);
 
   afterEach(async () => {
     while (fixtureRoots.length > 0) {
@@ -137,7 +137,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
 
   afterAll(async () => {
     await stopDb?.();
-  });
+  }, 30_000);
 
   async function seedEnvironment(input: {
     driver?: string;
