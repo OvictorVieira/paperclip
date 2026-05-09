@@ -27,7 +27,7 @@ describeEmbeddedPostgres("environmentService leases", () => {
     stopDb = started.stop;
     db = createDb(started.connectionString);
     svc = environmentService(db);
-  });
+  }, 30_000);
 
   afterEach(async () => {
     await db.delete(environmentLeases);
@@ -39,7 +39,7 @@ describeEmbeddedPostgres("environmentService leases", () => {
 
   afterAll(async () => {
     await stopDb?.();
-  });
+  }, 30_000);
 
   async function seedEnvironment() {
     const companyId = randomUUID();
