@@ -125,6 +125,28 @@ function isOverlayDirty(o: AgentConfigOverlay): boolean {
   );
 }
 
+function agentUpdatedAtMs(agent: Agent): number {
+  const value = agent.updatedAt;
+  return value instanceof Date ? value.getTime() : new Date(value).getTime();
+}
+
+export function readCheapProfileFromRuntimeConfig(runtimeConfig: Record<string, unknown>): {
+  enabled: boolean;
+  model: string;
+} {
+  const profiles = (runtimeConfig.modelProfiles ?? {}) as Record<string, unknown>;
+  const rawCheap = profiles.cheap;
+  const cheap =
+    rawCheap && typeof rawCheap === "object" && !Array.isArray(rawCheap)
+      ? rawCheap as Record<string, unknown>
+      : null;
+  const cheapAdapterConfig = (cheap?.adapterConfig ?? {}) as Record<string, unknown>;
+  return {
+    enabled: cheap ? cheap.enabled !== false : false,
+    model: typeof cheapAdapterConfig.model === "string" ? cheapAdapterConfig.model : "",
+  };
+}
+
 /* ---- Shared input class ---- */
 const inputClass =
   "w-full rounded-md border border-border px-2.5 py-1.5 bg-transparent outline-none text-sm font-mono placeholder:text-muted-foreground/40";
@@ -248,15 +270,31 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
   // ---- Edit mode: overlay for dirty tracking ----
   const [overlay, setOverlay] = useState<AgentConfigOverlay>(emptyOverlay);
   const agentRef = useRef<Agent | null>(null);
+  const saveInFlightRef = useRef(false);
 
-  // Clear overlay when agent data refreshes (after save)
+  // Keep pending edits through background refreshes of the same agent. Clear
+  // only when switching agents or when the saved row returns with a new stamp.
   useEffect(() => {
-    if (!isCreate) {
-      if (agentRef.current !== null && props.agent !== agentRef.current) {
-        setOverlay({ ...emptyOverlay });
-      }
+    if (isCreate) return;
+
+    const previous = agentRef.current;
+    if (!previous) {
       agentRef.current = props.agent;
+      return;
     }
+
+    if (props.agent.id !== previous.id) {
+      saveInFlightRef.current = false;
+      setOverlay({ ...emptyOverlay });
+    } else if (
+      saveInFlightRef.current &&
+      agentUpdatedAtMs(props.agent) !== agentUpdatedAtMs(previous)
+    ) {
+      saveInFlightRef.current = false;
+      setOverlay({ ...emptyOverlay });
+    }
+
+    agentRef.current = props.agent;
   }, [isCreate, !isCreate ? props.agent : undefined]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const isDirty = !isCreate && isOverlayDirty(overlay);
@@ -280,11 +318,13 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
 
   /** Build accumulated patch and send to parent */
   const handleCancel = useCallback(() => {
+    saveInFlightRef.current = false;
     setOverlay({ ...emptyOverlay });
   }, []);
 
   const handleSave = useCallback(() => {
     if (isCreate || !isDirty) return;
+    saveInFlightRef.current = true;
     props.onSave(buildAgentUpdatePatch(props.agent, overlay));
   }, [isCreate, isDirty, overlay, props]);
 
@@ -584,13 +624,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
   // runtimeConfig.modelProfiles.cheap with overlay overrides on top; create-mode
   // values come straight from CreateConfigValues (cheapModel + cheapModelEnabled).
   const cheapProfileFromAgent = useMemo(() => {
-    const profiles = (runtimeConfig.modelProfiles ?? {}) as Record<string, unknown>;
-    const cheap = (profiles.cheap ?? {}) as Record<string, unknown>;
-    const cheapAdapterConfig = (cheap.adapterConfig ?? {}) as Record<string, unknown>;
-    return {
-      enabled: cheap.enabled !== false,
-      model: typeof cheapAdapterConfig.model === "string" ? cheapAdapterConfig.model : "",
-    };
+    return readCheapProfileFromRuntimeConfig(runtimeConfig);
   }, [runtimeConfig]);
   const cheapOverlay = !isCreate ? overlay.modelProfiles?.cheap : undefined;
   const currentCheapEnabled = isCreate
